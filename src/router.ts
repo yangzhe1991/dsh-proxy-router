@@ -66,6 +66,17 @@ export interface RouterServer {
   stats(): RouterStats
 }
 
+/** 控制接口前缀:只有目标指向本机代理自己的请求才走它(与 index.ts 共用同一常量)。 */
+export const CONTROL_PREFIX = '/__proxy-router/'
+
+/**
+ * 回环名称判定:127.0.0.1 / localhost / ::1 视为同一台机器。
+ * 用于两处防自环:目标是不是本代理自己、上游是不是也指向本代理自己。
+ */
+export function isLoopbackName(host: string): boolean {
+  return host === 'localhost' || host === '::1' || host === '[::1]' || /^127\./.test(host)
+}
+
 /** 目标主机端口。 */
 interface Authority {
   host: string
@@ -138,6 +149,41 @@ export function createRouterServer(options: RouterServerOptions): RouterServer {
   const stats: RouterStats = { total: 0, direct: 0, proxied: 0, failed: 0, fallback: 0 }
   const sockets = new Set<Socket>()
   let local: { host: string; port: number } = { host: '127.0.0.1', port: 0 }
+
+  /**
+   * 目标是不是本代理自己。
+   *
+   * 这是必须拦的一条:**把发往自己地址的请求再转发给自己 = 自我递归**。
+   * 一个请求会在几毫秒内滚成上万次(实测:1 个请求 → 17696 次请求、12588 条警告),
+   * 线上曾因此刷出 1.1 亿次请求把终端刷屏。触发者往往很无辜:
+   * 在浏览器里点开 `http://127.0.0.1:17890/...` 看状态时,浏览器会顺手请求 /favicon.ico,
+   * 而那条路径不在控制接口前缀里,于是被当作普通代理请求处理。
+   */
+  const targetsSelf = (host: string, port: string): boolean => {
+    if (local.port <= 0) return false
+    if (port !== String(local.port)) return false
+    if (host.toLowerCase() === local.host.toLowerCase()) return true
+    return isLoopbackName(host) && isLoopbackName(local.host)
+  }
+
+  /**
+   * 限流告警:同一个 key(通常是「哪条路径/哪个目标」)每 5 秒最多打一行,
+   * 期间被压掉的条数在下一次输出时汇总。任何异常放大都不该刷屏用户的终端。
+   */
+  const WARN_INTERVAL_MS = 5000
+  const warnState = new Map<string, { last: number; suppressed: number }>()
+  const warnLimited = (key: string, message: () => string): void => {
+    const now = Date.now()
+    if (warnState.size > 256) warnState.clear() // 防 key 无限增长
+    const state = warnState.get(key)
+    if (state !== undefined && now - state.last < WARN_INTERVAL_MS) {
+      state.suppressed++
+      return
+    }
+    const suffix = state !== undefined && state.suppressed > 0 ? `(同类警告已抑制 ${state.suppressed} 条)` : ''
+    warnState.set(key, { last: now, suppressed: 0 })
+    options.log.warn(`${message()}${suffix}`)
+  }
 
   const track = (socket: Socket): Socket => {
     sockets.add(socket)
@@ -265,6 +311,11 @@ export function createRouterServer(options: RouterServerOptions): RouterServer {
       return
     }
     stats.total++
+    if (targetsSelf(authority.host, authority.port)) {
+      warnLimited('self-connect', () => `收到指向本地分流代理自身的 CONNECT(${authority.host}:${authority.port}),已拒绝`)
+      respondPlain(clientSocket, 421, 'Misdirected Request')
+      return
+    }
     const decision = options.decide(authority.host, authority.port)
     if (options.getDebug()) {
       options.log.debug(`CONNECT ${authority.host}:${authority.port} → ${decision.route} (${decision.reason})`)
@@ -283,7 +334,7 @@ export function createRouterServer(options: RouterServerOptions): RouterServer {
         },
         (error) => {
           stats.failed++
-          options.log.warn(`直连失败 ${authority.host}:${authority.port}: ${error.message}`)
+          warnLimited(`connect-fail ${authority.host}:${authority.port}`, () => `直连失败 ${authority.host}:${authority.port}: ${error.message}`)
           respondPlain(clientSocket, 502, 'Bad Gateway')
         },
       )
@@ -304,7 +355,7 @@ export function createRouterServer(options: RouterServerOptions): RouterServer {
         bridge(clientSocket, upstreamSocket)
       },
       (error) => {
-        options.log.warn(`上游代理失败 ${authority.host}:${authority.port}: ${error.message}`)
+        warnLimited(`upstream-fail ${authority.host}:${authority.port}`, () => `上游代理失败 ${authority.host}:${authority.port}: ${error.message}`)
         if (options.getFallbackDirect()) {
           stats.fallback++
           options.log.warn(`回退直连 ${authority.host}:${authority.port}`)
@@ -317,6 +368,40 @@ export function createRouterServer(options: RouterServerOptions): RouterServer {
     )
   }
 
+  /**
+   * 收到「目标是自己」的请求时的应答:不转发,直接给一句人话。
+   * 顺手用限流告警记下方法/路径/UA —— 这正是排查「谁在打这个端口」的线索。
+   */
+  const respondSelfTarget = (req: IncomingMessage, res: ServerResponse, path: string): void => {
+    warnLimited(`self-target ${req.method ?? 'GET'} ${path}`, () =>
+      `收到指向本地分流代理自身的请求(${req.method ?? 'GET'} ${path},Host: ${req.headers.host ?? '?'},` +
+        `UA: ${req.headers['user-agent'] ?? '?'}),已拒绝转发以避免自我递归`,
+    )
+    if (path === '/favicon.ico') {
+      res.writeHead(204)
+      res.end()
+      return
+    }
+    const body =
+      path === '/'
+        ? [
+            'dsh-proxy-router 本地分流代理',
+            '',
+            `监听: ${local.host}:${local.port}`,
+            '这个端口不是 Web 服务,而是给 DSH 出网用的分流代理。',
+            `看运行状态: http://${local.host}:${local.port}${CONTROL_PREFIX}status`,
+            '宿主 Web UI 请用 dsh web 启动时打印的地址。',
+            '',
+          ].join('\n')
+        : `proxy-router: ${path} 不是本代理的接口。\n状态接口: ${CONTROL_PREFIX}status\n`
+    res.writeHead(path === '/' ? 200 : 421, {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store',
+      connection: 'close',
+    })
+    res.end(body)
+  }
+
   /** 普通 http 请求:直连时把请求行改写成 origin-form,走上游时保持绝对形式。 */
   const handleRequest = (req: IncomingMessage, res: ServerResponse): void => {
     if (options.handleControl?.(req, res, local) === true) return
@@ -327,6 +412,11 @@ export function createRouterServer(options: RouterServerOptions): RouterServer {
       return
     }
     const { authority, absoluteUrl, path } = resolved
+    if (targetsSelf(authority.host, authority.port)) {
+      stats.total++
+      respondSelfTarget(req, res, path)
+      return
+    }
     stats.total++
     const decision = options.decide(authority.host, authority.port)
     if (options.getDebug()) {
@@ -406,7 +496,7 @@ export function createRouterServer(options: RouterServerOptions): RouterServer {
     })
     out.on('error', (error: Error) => {
       stats.failed++
-      options.log.warn(`${label} 失败: ${error.message}`)
+      warnLimited(`plain-fail ${label}`, () => `${label} 失败: ${error.message}`)
       if (!res.headersSent) {
         res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', connection: 'close' })
         res.end(`proxy-router: ${label} 失败: ${error.message}\n`)
@@ -433,6 +523,11 @@ export function createRouterServer(options: RouterServerOptions): RouterServer {
     }
     const { authority, absoluteUrl, path } = resolved
     stats.total++
+    if (targetsSelf(authority.host, authority.port)) {
+      warnLimited('self-upgrade', () => `收到指向本地分流代理自身的 Upgrade(${authority.host}:${authority.port}${path}),已拒绝`)
+      respondPlain(clientSocket, 421, 'Misdirected Request')
+      return
+    }
     const decision = options.decide(authority.host, authority.port)
     if (options.getDebug()) {
       options.log.debug(`UPGRADE ${authority.host}:${authority.port}${path} → ${decision.route} (${decision.reason})`)
@@ -468,7 +563,7 @@ export function createRouterServer(options: RouterServerOptions): RouterServer {
       },
       (error) => {
         stats.failed++
-        options.log.warn(`Upgrade 失败 ${authority.host}:${authority.port}: ${error.message}`)
+        warnLimited(`upgrade-fail ${authority.host}:${authority.port}`, () => `Upgrade 失败 ${authority.host}:${authority.port}: ${error.message}`)
         respondPlain(clientSocket, 502, 'Bad Gateway')
       },
     )

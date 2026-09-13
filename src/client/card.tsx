@@ -173,6 +173,9 @@ function StatusPanel(props: { status: HostStatus | null; error: boolean; onRefre
       const child = status.policy.childRouting === 'router' ? '走分流' : status.policy.childRouting === 'upstream' ? '直连上游(绕过分流)' : '无'
       rows.push(['宿主策略', `${status.policy.verified ? '已接管并自检通过' : '自检未通过'};bash 子进程:${child}`])
     }
+    if (status.upstreamIgnored === true) {
+      rows.push(['注意', '上游地址指向了插件自己的监听地址,已被忽略(否则会自我循环);请改成真实代理地址'])
+    }
     if (status.rules !== undefined) {
       rows.push(['规则', `本地 ${status.rules.local} / 远程 ${status.rules.remote} / 内置 ${status.rules.seed}`])
     }

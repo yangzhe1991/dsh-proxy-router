@@ -19,7 +19,7 @@
 import { RuleStore, parseRules } from './rules.js'
 import { SEED_BLOCKED_DOMAINS } from './seed.js'
 import { RuleLoader } from './lists.js'
-import { createRouterServer, type RouterServer } from './router.js'
+import { CONTROL_PREFIX, createRouterServer, isLoopbackName, type RouterServer } from './router.js'
 import { createTextFetcher, type Logger, type TextFetcher } from './fetcher.js'
 import { installRouterPolicy, type InstalledPolicy } from './host-policy.js'
 import {
@@ -28,6 +28,7 @@ import {
   settingsValueFromComposition,
   type CompositionExtras,
   type ResolvedConfig,
+  type ResolvedUpstream,
   type SettingsValue,
 } from './config.js'
 import { installSettingsSection, PROXY_ROUTER_NAMESPACE, type SettingsInstallation } from './settings.js'
@@ -42,8 +43,6 @@ export interface HostContextLike {
   inject?(deps: readonly string[], callback: (ctx: HostContextLike) => unknown): unknown
 }
 
-/** 控制接口前缀:只有目标指向本机代理自己的请求才走它,其余一律当代理请求处理。 */
-const CONTROL_PREFIX = '/__proxy-router/'
 /** Web 服务器上的只读状态路由(设置页那张卡片读它;同源,无需 CORS)。 */
 export const STATUS_ROUTE_PATH = '/dsh-proxy-router/status'
 
@@ -132,6 +131,8 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
   let localProxyUrl: string | null = null
   let started = false
   let shuttingDown = false
+  /** 在飞的热应用:卸载要先等它落地,否则可能留下没人管的监听/策略。 */
+  let reconcileInFlight: Promise<void> | null = null
   const routeDisposers: (() => void)[] = []
 
   /** 状态快照:本地代理的控制接口与 Web 设置页读的是同一份。 */
@@ -143,6 +144,8 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
       listening: bound,
       upstream:
         runtime.upstream === null ? null : { url: redactUpstream(runtime.upstream.url), source: runtime.upstream.source },
+      /** 配置了上游但被判定为指向自己(忽略)时为 true,设置页据此提示。 */
+      upstreamIgnored: refusedUpstream !== null,
       defaultRoute: runtime.defaultRoute,
       refreshHours: runtime.refreshHours,
       fallbackDirect: runtime.fallbackDirect,
@@ -180,11 +183,50 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
       log,
     })
 
+  /**
+   * 生效的上游:指向本插件自己的监听地址时必须忽略。
+   *
+   * 那是必然的死循环:规则说走代理 → CONNECT 到自己 → 自己又按规则转发给自己。
+   * 用户把本地代理地址误填进「上游代理」是最容易犯的错(状态页上就有这个地址)。
+   */
+  let refusedUpstream: string | null = null
+  const effectiveUpstream = (): ResolvedUpstream | null => {
+    const upstream = runtime.upstream
+    if (upstream === null) {
+      refusedUpstream = null
+      return null
+    }
+    if (
+      bound !== null &&
+      upstream.port === bound.port &&
+      (upstream.host === bound.host || (isLoopbackName(upstream.host) && isLoopbackName(bound.host)))
+    ) {
+      if (refusedUpstream !== upstream.url) {
+        refusedUpstream = upstream.url
+        log.warn(
+          `上游代理指向了本插件自己的监听地址(${upstream.url}),已忽略以避免自我循环;` +
+            '请在设置页把上游改成本机之外的真实代理地址',
+        )
+      }
+      return null
+    }
+    refusedUpstream = null
+    return upstream
+  }
+
+  /**
+   * 主动跑一次上游判定:把「上游填成了自己」这件事在启动/改设置时就报出来,
+   * 而不是等第一个被墙域名请求到达才告警 —— 那时用户已经在等结果了。
+   */
+  const noteUpstream = (): void => {
+    void effectiveUpstream()
+  }
+
   /** 建一个本地分流代理;上游/超时/回退/调试都走 getter,所以配置改了不用重建。 */
   const createServer = (): RouterServer =>
     createRouterServer({
       decide: (host) => store.decide(host, runtime.defaultRoute),
-      getUpstream: () => runtime.upstream,
+      getUpstream: effectiveUpstream,
       getConnectTimeoutMs: () => runtime.connectTimeoutMs,
       getFallbackDirect: () => runtime.fallbackDirect,
       getDebug: () => runtime.debug,
@@ -194,7 +236,9 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
 
   /** 重新绑定监听地址:关掉旧监听 → 起新的 → 把宿主策略重新指过去。 */
   const rebind = async (next: ResolvedConfig): Promise<void> => {
+    if (shuttingDown) return
     await server?.close().catch(() => {})
+    if (shuttingDown) return
     server = createServer()
     bound = await server.listen(next.listen.host, next.listen.port)
     localProxyUrl = `http://${bound.host}:${bound.port}`
@@ -203,10 +247,12 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
     log.info(
       `监听地址已切到 ${bound.host}:${bound.port}${bound.ephemeral ? '(端口被占用,已改用随机端口)' : ''},宿主策略已重新指向它`,
     )
+    noteUpstream()
   }
 
   /** 清单相关配置变了:重建装载器(先读缓存,再后台刷新)。 */
   const reloadRules = async (next: ResolvedConfig): Promise<void> => {
+    if (shuttingDown) return
     loader?.close()
     loader = createLoader(next)
     await loader.start()
@@ -224,16 +270,20 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
     const listsChanged =
       previous.refreshHours !== runtime.refreshHours ||
       JSON.stringify(previous.lists) !== JSON.stringify(runtime.lists)
-    void (async () => {
+    reconcileInFlight = (async () => {
       try {
         if (listenChanged) await rebind(runtime)
         else if (listsChanged) await reloadRules(runtime)
+        if (shuttingDown) return
+        if (!listenChanged) noteUpstream()
         log.info(
           `设置已更新: 上游 ${runtime.upstream === null ? '(未配置)' : runtime.upstream.url};` +
             `未命中默认${runtime.defaultRoute === 'proxy' ? '走代理' : '直连'};调试${runtime.debug ? '开' : '关'}`,
         )
       } catch (error) {
         log.warn(`设置热应用失败: ${String(error)}`)
+      } finally {
+        reconcileInFlight = null
       }
     })()
   }
@@ -241,6 +291,8 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return
     shuttingDown = true
+    // 等在飞的热应用落地:否则它可能在收摊之后又装回一套监听与策略
+    if (reconcileInFlight !== null) await reconcileInFlight.catch(() => {})
     for (const dispose of routeDisposers.splice(0)) {
       try {
         dispose()
@@ -265,7 +317,7 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
 
     // 2) 清单装载(先用本地规则 + 缓存,网络刷新放后台)
     fetcher = await createTextFetcher({
-      getUpstream: () => runtime.upstream?.url ?? null,
+      getUpstream: () => effectiveUpstream()?.url ?? null,
       timeoutMs: Math.max(30_000, runtime.connectTimeoutMs),
       log,
     })
@@ -280,6 +332,7 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
     // 4) 接管宿主代理策略(起得来本地代理才谈得上接管)
     policy = await installRouterPolicy({ localProxyUrl, userNoProxy, log })
     started = true
+    noteUpstream()
 
     log.info(
       `上游代理: ${runtime.upstream === null ? '(未配置,规则命中的目标将退化为直连)' : `${runtime.upstream.url} (来自 ${runtime.upstream.source})`}`,

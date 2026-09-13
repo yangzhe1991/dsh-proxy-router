@@ -1,6 +1,6 @@
 {
   "name": "@yangzhe1991/dsh-proxy-router",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH 插件:本地分流代理 + Web 设置页 —— 只有规则命中的被墙域名走上游代理,其余(国内/内网/未知)直连;上游地址、清单、超时等参数直接在设置里改,热生效、免重启,并带运行状态面板 | DSH plugin: local routing proxy with a Web settings page — only rule-matched (blocked) hosts use the upstream proxy, everything else goes direct; the upstream address, blocklists, timeouts and more are edited in Settings and applied live, with a built-in status panel",
   "publishConfig": {
     "access": "public"

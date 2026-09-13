@@ -532,6 +532,106 @@ console.log('\n[7] 客户端字段规则')
   check('覆盖判定只看 key 在不在', isOverridden({ debug: false }, 'debug') && !isOverridden({}, 'upstream'))
 }
 
+// ──────────── 8. 防自环(线上曾刷出 1.1 亿次请求) ────────────
+console.log('\n[8] 防自环')
+{
+  const net = await import('node:net')
+  const http = await import('node:http')
+  const { createRouterServer } = await import('../src/router.ts')
+  /** 直接用 node:http 打代理端口(绕开进程全局 dispatcher,也更贴近浏览器/curl 的真实行为)。 */
+  const rawGet = (url, timeoutMs = 4000) =>
+    new Promise((resolve) => {
+      const req = http.get(url, (res) => {
+        let body = ''
+        res.on('data', (chunk) => (body += chunk))
+        res.on('end', () => resolve({ status: res.statusCode, body }))
+      })
+      req.setTimeout(timeoutMs, () => {
+        req.destroy()
+        resolve({ status: 0, body: 'timeout' })
+      })
+      req.on('error', (error) => resolve({ status: 0, body: error.message }))
+    })
+  const warns = []
+  const isolated = createRouterServer({
+    decide: () => ({ route: 'direct', reason: 'private' }),
+    getUpstream: () => null,
+    getConnectTimeoutMs: () => 1000,
+    getDebug: () => false,
+    getFallbackDirect: () => true,
+    log: { info: () => {}, warn: (message) => warns.push(message), debug: () => {} },
+  })
+  const bound = await isolated.listen('127.0.0.1', PORT + 4)
+  const base = `http://127.0.0.1:${bound.port}`
+  const before = isolated.stats().total
+
+  const probe = await rawGet(`${base}/probe-self`)
+  check('目标=自己的明文请求被拒绝(421)', probe.status === 421, String(probe.status))
+  const favicon = await rawGet(`${base}/favicon.ico`)
+  check('favicon 返回 204(浏览器打开代理端口不再引爆循环)', favicon.status === 204, String(favicon.status))
+  const root = await rawGet(`${base}/`)
+  check('根路径返回人话提示', root.status === 200 && root.body.includes('分流代理'), String(root.status))
+
+  const connectReply = await new Promise((resolve) => {
+    const socket = net.connect(bound.port, '127.0.0.1', () => {
+      socket.write(`CONNECT 127.0.0.1:${bound.port} HTTP/1.1\r\nHost: probe\r\n\r\n`)
+    })
+    socket.once('data', (data) => {
+      resolve(String(data).slice(0, 16))
+      socket.destroy()
+    })
+    socket.once('error', () => resolve('error'))
+    setTimeout(() => {
+      socket.destroy()
+      resolve('timeout')
+    }, 3000)
+  })
+  check('CONNECT 到自己被拒绝而不是递归', String(connectReply).includes('421'), String(connectReply))
+
+  // 同样的请求再打 5 次:限流应当只让第一行通过(否则浏览器一刷新就刷屏)
+  for (let i = 0; i < 5; i++) await rawGet(`${base}/probe-self`)
+  const delta = isolated.stats().total - before
+  check('未发生自我递归(请求数增量 <= 11)', delta <= 11, `增量 ${delta}(修复前一次请求会滚成上万次)`)
+  check(
+    '同一情况的告警被限流(只记一行,并带方法与路径)',
+    warns.length === 4 && warns[0].includes('自我递归') && warns[0].includes('/probe-self'),
+    `${warns.length} 行:${warns.join(' | ').slice(0, 120)}`,
+  )
+  await isolated.close()
+
+  // B) 完整装配:上游被填成插件自己的监听地址 → 必须忽略,且规则命中时退化为直连而不是死循环
+  const STATE8 = join(HERE, '.test-state-8')
+  rmSync(STATE8, { recursive: true, force: true })
+  mkdirSync(STATE8, { recursive: true })
+  const rulesFile8 = join(STATE8, 'rules.txt')
+  writeFileSync(rulesFile8, 'proxy: www.baidu.com\n', 'utf8')
+  const ctx8 = { get: () => undefined, effect: (fn) => disposers.push(fn()) }
+  apply(ctx8, {
+    upstream: `http://127.0.0.1:${PORT}`,
+    listen: `127.0.0.1:${PORT}`,
+    lists: [],
+    refreshHours: 0,
+    stateDir: STATE8,
+    rulesFile: rulesFile8,
+  })
+  const status8 = await waitForReady()
+  // 状态里保留用户填的原值(设置页要显示它),另用 upstreamIgnored 标注「已忽略」——
+  // 这样用户看得到自己填了什么、也看得到为什么没生效。
+  check(
+    '上游指向自己时被忽略并在状态里标注',
+    status8.upstreamIgnored === true && String(status8.upstream?.url ?? '').startsWith('http://127.0.0.1:'),
+    JSON.stringify({ upstream: status8.upstream, ignored: status8.upstreamIgnored }),
+  )
+  const why8 = await (await fetch(`${LOCAL}/__proxy-router/why?host=www.baidu.com`)).json()
+  check('规则本身仍判定为 proxy(只是没有可用上游)', why8.route === 'proxy', JSON.stringify(why8))
+  const statsBefore = (await (await fetch(`${LOCAL}/__proxy-router/status`)).json()).stats.total
+  const baidu = await curlThroughProxy('https://www.baidu.com/')
+  const statsAfter = (await (await fetch(`${LOCAL}/__proxy-router/status`)).json()).stats.total
+  check('规则命中但没有上游时退化为直连且不循环', baidu.code === '200' && statsAfter - statsBefore <= 3, `${baidu.code || baidu.err};增量 ${statsAfter - statsBefore}`)
+  for (const dispose of disposers.splice(0)) await dispose()
+  rmSync(STATE8, { recursive: true, force: true })
+}
+
 rmSync(STATE_DIR, { recursive: true, force: true })
 rmSync(join(HERE, '.test-state-2'), { recursive: true, force: true })
 

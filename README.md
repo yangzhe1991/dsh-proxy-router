@@ -144,9 +144,15 @@ curl -x http://127.0.0.1:17890 -sI https://www.baidu.com    # direct
 
 The startup log prints the upstream and its source, the bind address, rule counts, the policy self-check result, the settings-page entry point, and whether bash subprocesses are routed too.
 
+## Robustness
+
+- **No self-recursion**: a request whose target is this proxy's own listen address is never forwarded (plain HTTP gets 421, `/favicon.ico` gets 204, `/` gets a human-readable hint). Without that guard, something as harmless as opening `http://127.0.0.1:17890/...` in a browser snowballs into a self-loop — 0.1.0 produced over a hundred million requests that way, so 0.1.1 rejects them outright.
+- **An upstream pointing at itself is ignored**: when the upstream equals this plugin's own listen address it is treated as "no upstream", with an explicit warning in the log and in the status panel, instead of CONNECTing back into itself.
+- **Rate-limited warnings**: one line per distinct failure every 5 seconds, with a suppressed-count summary, so no failure mode can flood your terminal.
+
 ## Compatibility
 
-- Verified against **dsh 0.1.5-rc.2** since **0.1.0**.
+- Verified against **dsh 0.1.5-rc.2** since **0.1.0** (the 0.1.1 self-loop fix is verified on that same version).
 - The host half depends only on the public exports of `@deepseek-ai/dsh-http-proxy`, `@deepseek-ai/schemastery` and `undici`, plus cordis' `ctx.get` / `ctx.effect` / `ctx.inject`; the browser half requires only `react` and no UI package.
 - The settings card uses the official settings system (`ctx.settings.installSection` + the `settings.plugin.item` slot). On a deployment without a settings provider the plugin falls back to its composition config and everything else keeps working.
 

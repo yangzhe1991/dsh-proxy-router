@@ -152,6 +152,8 @@ export interface HostStatus {
   settingsRegistered?: boolean
   listening?: { host: string; port: number } | null
   upstream?: { url: string; source: string } | null
+  /** 配置了上游但被判定为指向插件自己(会被忽略)时由宿主置真。 */
+  upstreamIgnored?: boolean
   defaultRoute?: string
   rules?: { local: number; remote: number; seed: number }
   rulesFile?: string
