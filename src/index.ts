@@ -2,15 +2,16 @@
  * @yangzhe1991/dsh-proxy-router 插件,node 半(宿主侧)。
  *
  * 装配顺序:
- *   1. 归一化组合配置,并注册设置命名空间 `proxy-router`(设置页可编辑,热生效)
+ *   1. 归一化行配置(cordis 已按 `Config` schema 校验并补默认值;volatile 字段是引用)
  *   2. 建规则表:内置种子 → 本地规则文件(热加载)→ 远程被墙清单缓存(后台刷新)
  *   3. 起本地分流代理(127.0.0.1,规则命中 proxy 的目标转发给上游,其余直连)
  *   4. 把宿主代理策略指向本地分流代理(undici 全局 dispatcher + no_proxy)
- *   5. 在宿主的 Web 服务器上挂一个只读状态路由,供设置页那张卡片显示运行态
+ *   5. 在宿主的 Web 服务器上挂一个只读状态路由,供 Plugins 页的配置卡片显示运行态
  *
- * 热应用:设置页每次保存都会回调 onChange → 重新解析运行时配置并核对差异。
- * 上游/默认走向/超时/回退/调试开关都是「现读」的(router、fetcher 拿的是 getter),
- * 所以改完立刻生效;只有监听地址与清单相关两项需要重建对应部件。
+ * 热应用(dsh 0.1.7 的 volatile 契约):设置页保存后,宿主把新值写进运行中 fiber 的引用
+ * 并发 `loader/volatile-update`,本插件据此重新解析配置、只重建受影响的部分 ——
+ * 上游/默认走向/超时/回退/调试都是「现读」的(router、fetcher 拿的是 getter),
+ * 改完立刻生效;只有监听地址与清单相关两项需要重建对应部件。
  *
  * 失败降级原则:任何一步抛错都只记日志,不向上抛 —— 插件最坏的结果是「不生效」,
  * 绝不能因为分流插件的配置问题把宿主启动搞挂。apply 本身不返回 promise,
@@ -23,20 +24,30 @@ import { CONTROL_PREFIX, createRouterServer, isLoopbackName, type RouterServer }
 import { createTextFetcher, type Logger, type TextFetcher } from './fetcher.js'
 import { installRouterPolicy, type InstalledPolicy } from './host-policy.js'
 import {
+  Config,
   compositionExtrasFrom,
+  normalizeSettingsValue,
+  readConfigRaw,
   resolveRuntimeConfig,
-  settingsValueFromComposition,
   type CompositionExtras,
+  type PluginConfigLike,
   type ResolvedConfig,
   type ResolvedUpstream,
   type SettingsValue,
 } from './config.js'
-import { installSettingsSection, PROXY_ROUTER_NAMESPACE, type SettingsInstallation } from './settings.js'
+
+/** 插件行配置 schema:宿主读这个导出来校验配置、生成 Plugins 页里的设置表单。 */
+export { Config }
+
+/** 设置命名空间 = 插件行 id(设置页按行 id 找 schema 与当前值)。 */
+export const PROXY_ROUTER_NAMESPACE = 'proxy-router'
 
 /** 插件 apply 收到的宿主上下文里,本插件用到的部分(cordis Context 结构兼容)。 */
 export interface HostContextLike {
   /** 读取 cordis 服务(缺服务时返回 undefined,不抛错)。 */
   get?(name: string): unknown
+  /** 订阅事件(volatile 配置热更新走 `loader/volatile-update`)。 */
+  on?(name: string, listener: (...args: never[]) => void): unknown
   /** 注册作用域 effect;回调可返回 disposer,插件卸载时执行。 */
   effect?(fn: () => void | (() => void), name?: string): unknown
   /** 服务可用时执行回调(服务缺失时回调不执行,不阻塞插件)。 */
@@ -111,18 +122,19 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
   const envSnapshot: Record<string, string | undefined> = { ...process.env }
   const envLookup = (name: string): string | undefined => lookupLaunchEnv(ctx, name) ?? envSnapshot[name]
 
-  /** 组合配置(路径类字段只在这里)+ 设置页形状的 base 值。 */
-  const extras: CompositionExtras = compositionExtrasFrom(config, log)
-  const entry: SettingsValue = settingsValueFromComposition(config, log)
+  /** 行配置(cordis 已按 Config schema 校验;volatile 字段是引用,每次读都取最新值)。 */
+  const configLike = (typeof config === 'object' && config !== null ? config : {}) as PluginConfigLike
+  const extras: CompositionExtras = compositionExtrasFrom(readConfigRaw(configLike), log)
+  /** 当前生效的设置值:volatile 热更新后这里读到的就是新值。 */
+  const entry = (): SettingsValue => normalizeSettingsValue(readConfigRaw(configLike), log)
   /** 用户原有的 no_proxy 语义要保留(它列出的域名本来就该直连)。 */
   const userNoProxy = envSnapshot.no_proxy ?? envSnapshot.NO_PROXY
 
   // —— 运行时状态 ——
   const store = new RuleStore()
   store.seed.addAll(parseRules(SEED_BLOCKED_DOMAINS.join('\n'), { defaultRoute: 'proxy', source: 'seed' }).rules)
-  let runtime: ResolvedConfig = resolveRuntimeConfig(entry, extras, envLookup, log)
+  let runtime: ResolvedConfig = resolveRuntimeConfig(entry(), extras, envLookup, log)
   debugEnabled = runtime.debug
-  let installation: SettingsInstallation | null = null
   let loader: RuleLoader | null = null
   let fetcher: TextFetcher | null = null
   let server: RouterServer | null = null
@@ -140,7 +152,8 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
     const counts = store.counts()
     return {
       namespace: PROXY_ROUTER_NAMESPACE,
-      settingsRegistered: installation?.isRegistered() ?? false,
+      /** 0.1.7 里配置就是插件行自身的 schema,没有单独的「设置分节」注册动作,恒为 true。 */
+      settingsRegistered: true,
       listening: bound,
       upstream:
         runtime.upstream === null ? null : { url: redactUpstream(runtime.upstream.url), source: runtime.upstream.source },
@@ -260,10 +273,16 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
     log.info(`清单配置已更新: ${loader.describe()}`)
   }
 
-  /** 设置变化:重新解析运行时配置,并只重建真正受影响的部分。 */
-  const applySettings = (next: SettingsValue): void => {
+  /**
+   * 配置变化(volatile 热更新)后重新解析运行时配置,并只重建真正受影响的部分。
+   *
+   * 触发点:宿主把设置页保存的新值写进运行中 fiber 的引用后,会在本插件的 fiber 上
+   * 发 `loader/volatile-update`(见 cordis-plugin-loader 的 `_commitVolatile`)。
+   * 上游/默认走向/超时/回退/调试是现读的,所以只有监听地址与清单两项需要重建。
+   */
+  const reconcileFromConfig = (): void => {
     const previous = runtime
-    runtime = resolveRuntimeConfig(next, extras, envLookup, log)
+    runtime = resolveRuntimeConfig(entry(), extras, envLookup, log)
     debugEnabled = runtime.debug
     if (!started || shuttingDown) return
     const listenChanged = previous.listen.host !== runtime.listen.host || previous.listen.port !== runtime.listen.port
@@ -287,6 +306,15 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
       }
     })()
   }
+
+  // volatile 配置热更新:宿主已把新值写进引用,这里只管重新解析并做必要重建。
+  ctx.on?.('loader/volatile-update', () => {
+    try {
+      reconcileFromConfig()
+    } catch (error) {
+      log.warn(`处理 volatile 配置更新失败: ${String(error)}`)
+    }
+  })
 
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return
@@ -312,10 +340,7 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
   })
 
   const start = async (): Promise<void> => {
-    // 1) 设置命名空间:成功注册后,设置页保存会实时回调 applySettings
-    installation = await installSettingsSection(ctx, { entry, log, onChange: applySettings })
-
-    // 2) 清单装载(先用本地规则 + 缓存,网络刷新放后台)
+    // 1) 清单装载(先用本地规则 + 缓存,网络刷新放后台)
     fetcher = await createTextFetcher({
       getUpstream: () => effectiveUpstream()?.url ?? null,
       timeoutMs: Math.max(30_000, runtime.connectTimeoutMs),
@@ -324,12 +349,12 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
     loader = createLoader(runtime)
     await loader.start()
 
-    // 3) 本地分流代理
+    // 2) 本地分流代理
     server = createServer()
     bound = await server.listen(runtime.listen.host, runtime.listen.port)
     localProxyUrl = `http://${bound.host}:${bound.port}`
 
-    // 4) 接管宿主代理策略(起得来本地代理才谈得上接管)
+    // 3) 接管宿主代理策略(起得来本地代理才谈得上接管)
     policy = await installRouterPolicy({ localProxyUrl, userNoProxy, log })
     started = true
     noteUpstream()
@@ -347,15 +372,15 @@ export function apply(ctx: HostContextLike, config?: unknown): void {
         ? '宿主策略未接管:主进程与子进程仍按原环境变量走代理'
         : `宿主策略已接管: undici 全局 dispatcher + web_fetch + bash 子进程 → ${localProxyUrl}${policy.verified ? ' (自检通过)' : ' (自检未通过,见上方警告)'}`,
     )
-    if (installation.isRegistered()) {
-      log.info(`设置页: Web 设置 → 插件 → 插件配置 → proxy-router(写入 ~/.dsh/settings.yaml,改完热生效)`)
-    }
+    log.info(
+      `配置页: Web 侧边栏 → Plugins → 找到本插件包 → 行 "proxy-router" → Configure(改完热生效,不重启宿主)`,
+    )
     log.info(`调试接口: curl -s http://${bound.host}:${bound.port}${CONTROL_PREFIX}status`)
 
-    // 5) Web 服务器上的状态路由(设置页卡片读它)
+    // 4) Web 服务器上的状态路由(Plugins 页那张卡片读它)
     registerStatusRoute(ctx)
 
-    // 6) 远程清单刷新放后台:首启已经用缓存/种子把规则表建好了,不需要等网络
+    // 5) 远程清单刷新放后台:首启已经用缓存/种子把规则表建好了,不需要等网络
     void loader.refresh(false).catch((error: unknown) => log.warn(`远程清单刷新失败: ${String(error)}`))
   }
 

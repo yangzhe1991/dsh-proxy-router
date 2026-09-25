@@ -3,13 +3,15 @@
 # 用户可在自己 profile 的 cordis.patch.yml 里按 id 覆盖配置或禁用此行。
 #
 # 这里的 config 是「部署默认值」(base 层):日常改配置请走
-# Web 设置 → 插件 → 插件配置 → proxy-router,那一层写进 ~/.dsh/settings.yaml 并热生效。
+# Web 侧边栏 Plugins → 本插件包 → 行 proxy-router → Configure,
+# 那一层的值写回本 profile 的用户层(cordis.patch.yml),标了 volatile 的字段热生效。
 # 部署默认值适合写「这台机器就长这样」的项:
 #
 #   - id: proxy-router
 #     config:
 #       upstream: http://192.168.3.47:12801
-#       stateDir: /data/dsh-proxy-router     # 路径类字段只在这里认(不进设置页)
+#       stateDir: /data/dsh-proxy-router     # 路径类字段只在这里认(不进配置页)
+#       lists: [https://.../gfw.txt]         # 远程清单同理,只在这里配
 - insert:
     - id: proxy-router
       name: '@yangzhe1991/dsh-proxy-router'

@@ -1,19 +1,19 @@
 /**
- * 配置层:把两个来源的配置归一化成插件内部用的完整配置。
+ * 配置层:把插件行的配置(cordis 校验+补默认值之后的对象)归一化成插件内部用的完整配置。
  *
- * 来源与优先级(高 → 低):
- *   1. 用户设置文档 `$DSH_HOME/settings.yaml` 的 `proxy-router:` 分节(设置页写的就是这里,热生效)
- *   2. profile 组合配置(`cordis.patch.yml` 里的行 config),作为 base/部署默认值
- *   3. 下面是 schema 默认值,再下面是环境变量兜底(仅上游代理)
- *
- * 只有路径类字段(stateDir / rulesFile)留在组合配置里、不进设置页:
- * 它们是部署事实,不是用户偏好。
+ * dsh 0.1.7 起,插件配置的来源统一成「插件行的 Config schema」:
+ *   - 组合配置(profile 的 `cordis.patch.yml` 里那行 config)= 部署默认值;
+ *   - 用户在 Plugins 页里填的值写回同一处(profile 用户层),由宿主合并后交给 apply;
+ *   - 字段带 `.volatile()` 标记的可以**热生效**:宿主把新值直接写进运行中 fiber 的
+ *     引用(ref),插件通过 `config.x.get()` 读到新值,并收到 `loader/volatile-update`;
+ *     没有 volatile 的字段只在(重新)挂载时生效。
  *
  * 归一化原则:每个字段都有默认值,配置写错类型只警告并回退默认值,**绝不抛错** ——
  * 插件装错配置最坏的结果应该是「不生效」,而不是把宿主启动搞挂。
  */
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import z from '@deepseek-ai/schemastery'
 import type { Route } from './rules.js'
 import type { Logger } from './fetcher.js'
 import type { UpstreamTarget } from './router.js'
@@ -26,8 +26,8 @@ export interface ResolvedUpstream extends UpstreamTarget {
 }
 
 /**
- * 设置页可编辑的那部分 —— 字段与 `settings.ts` 里的 schema 一一对应,
- * 也是写进 `settings.yaml` 的形状。
+ * 设置页可编辑的那部分 —— 字段与上面的 `Config` schema 一一对应,
+ * 也是归一化之后插件内部使用的形状。
  */
 export interface SettingsValue {
   /** 上游代理地址;空串表示沿用环境变量/未配置。 */
@@ -92,6 +92,108 @@ const SETTINGS_KEYS = [
 ] as const
 /** 只有组合配置认的字段名。 */
 const EXTRAS_KEYS = ['stateDir', 'rulesFile'] as const
+
+/**
+ * 插件行配置 schema(dsh 0.1.7 的插件配置契约:宿主读插件模块导出的 `Config`)。
+ *
+ * `.volatile()` 的含义:这个字段可以在 Plugins 页里改、并且**不重挂插件**就生效
+ * (宿主把新值写进运行中 fiber 的引用,插件收到 `loader/volatile-update`)。
+ * 只有 volatile 字段会出现在设置表单里 —— 因此运行期可调的旋钮全部标了 volatile。
+ *
+ * `lists` / `stateDir` / `rulesFile` 故意不标 volatile:它们是部署事实或长列表,
+ * 不属于「随手改一下」的偏好项,留在 profile 的 cordis.patch.yml 里配置。
+ */
+export const Config = z.object({
+  upstream: z
+    .string()
+    .default('')
+    .volatile()
+    .description('上游代理地址,例如 http://192.168.3.47:12801;留空则沿用启动环境里的 https_proxy/http_proxy'),
+  defaultRoute: z
+    .union(['direct', 'proxy'])
+    .default('direct')
+    .volatile()
+    .description('未命中任何规则时的走向:direct 直连(推荐)、proxy 走上游'),
+  listen: z
+    .string()
+    .default(DEFAULT_LISTEN)
+    .volatile()
+    .description('本地分流代理监听地址(改动会立即重新绑定;端口被占用时自动改用随机端口)'),
+  refreshHours: z
+    .number()
+    .min(0)
+    .default(DEFAULT_REFRESH_HOURS)
+    .volatile()
+    .description('远程被墙清单刷新周期(小时),0 表示不自动刷新'),
+  connectTimeoutMs: z
+    .number()
+    .min(1000)
+    .default(DEFAULT_CONNECT_TIMEOUT_MS)
+    .volatile()
+    .description('建立连接的超时时间(毫秒)'),
+  fallbackDirect: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('走上游失败时自动回退直连'),
+  debug: z.boolean().default(false).volatile().description('每次请求在宿主 stderr 打一行分流日志'),
+  lists: z
+    .array(z.string())
+    .default([...DEFAULT_LIST_URLS])
+    .description('远程被墙清单 URL;命中的域名走上游代理(只在 profile 配置里改)'),
+  stateDir: z.string().default(join(dshHome(), 'proxy-router')).description('本地状态目录:规则文件与清单缓存(只在 profile 配置里改)'),
+  rulesFile: z.string().default('').description('本地规则文件路径;留空 = <stateDir>/rules.txt(只在 profile 配置里改)'),
+})
+
+/** volatile 字段在运行中的样子:一个可读当前值的引用。 */
+export interface VolatileRef<T> {
+  get(): T
+}
+
+/** 配置对象里本插件用到的字段(宿主已按 schema 校验并补默认值)。 */
+export interface PluginConfigLike {
+  readonly upstream?: VolatileRef<string> | string
+  readonly defaultRoute?: VolatileRef<Route> | Route
+  readonly listen?: VolatileRef<string> | string
+  readonly refreshHours?: VolatileRef<number> | number
+  readonly connectTimeoutMs?: VolatileRef<number> | number
+  readonly fallbackDirect?: VolatileRef<boolean> | boolean
+  readonly debug?: VolatileRef<boolean> | boolean
+  readonly lists?: readonly string[]
+  readonly stateDir?: string
+  readonly rulesFile?: string
+}
+
+/**
+ * 读一个配置字段的当前值。
+ *
+ * volatile 字段拿到的是引用(`{ get() }`),非 volatile 字段是普通值;两种形态都接受,
+ * 这样插件在「宿主没把字段标成 volatile」或「配置来自测试的普通对象」时行为一致。
+ */
+export function refValue<T>(node: VolatileRef<T> | T | undefined, fallback: T): T {
+  if (node === undefined || node === null) return fallback
+  if (typeof node === 'object' && 'get' in node && typeof (node as VolatileRef<T>).get === 'function') {
+    const value = (node as VolatileRef<T>).get()
+    return value === undefined || value === null ? fallback : value
+  }
+  return node as T
+}
+
+/** 当前配置的原始值快照(每次读都取最新值 —— volatile 热更新后的值就在里面)。 */
+export function readConfigRaw(config: PluginConfigLike): Record<string, unknown> {
+  return {
+    upstream: refValue(config.upstream, ''),
+    defaultRoute: refValue(config.defaultRoute, 'direct'),
+    listen: refValue(config.listen, DEFAULT_LISTEN),
+    refreshHours: refValue(config.refreshHours, DEFAULT_REFRESH_HOURS),
+    connectTimeoutMs: refValue(config.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS),
+    fallbackDirect: refValue(config.fallbackDirect, true),
+    debug: refValue(config.debug, false),
+    lists: config.lists,
+    stateDir: config.stateDir,
+    rulesFile: config.rulesFile,
+  }
+}
 
 /** DSH 家目录:优先跟随宿主进程的 DSH_HOME,否则 `~/.dsh`。 */
 export function dshHome(): string {
@@ -250,7 +352,9 @@ export function compositionExtrasFrom(raw: unknown, log: Logger): CompositionExt
     log.warn(`配置里有未知字段 "${key}",已忽略`)
   }
   const stateDir = stringField(record.stateDir, join(dshHome(), 'proxy-router'), 'stateDir', log)
-  const rulesFile = stringField(record.rulesFile, join(stateDir, 'rules.txt'), 'rulesFile', log)
+  // 空串 = 没配:默认落在状态目录里,保证「改完即时生效」的那个文件总在同一个地方。
+  const configuredRules = stringField(record.rulesFile, '', 'rulesFile', log)
+  const rulesFile = configuredRules === '' ? join(stateDir, 'rules.txt') : configuredRules
   return { stateDir, rulesFile }
 }
 

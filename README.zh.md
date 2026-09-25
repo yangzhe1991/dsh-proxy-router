@@ -7,7 +7,7 @@
 [![license](https://img.shields.io/github/license/yangzhe1991/dsh-proxy-router)](LICENSE)
 [![dsh-plugin](https://img.shields.io/badge/dsh-plugin-1e90ff)](https://github.com/topics/dsh-plugin)
 
-DSH(DeepSeek Harness)分流代理插件:只有**规则命中的被墙域名**走上游代理,其余(国内站点、内网地址、未知域名)一律直连,**配置项直接放在 Web 设置页里**。
+DSH(DeepSeek Harness)分流代理插件:只有**规则命中的被墙域名**走上游代理,其余(国内站点、内网地址、未知域名)一律直连,**配置项直接在 Web 的 Plugins 页里改、热生效**。
 
 起因很实际:启动 dsh 时 `export https_proxy=... http_proxy=... all_proxy=...` 之后,连 `api.deepseek.com`、`www.baidu.com` 都绕一圈代理。这个插件把「什么时候该走代理」变成一张可维护的规则表,把「上游是谁」变成一个能随时改的设置项。
 
@@ -30,7 +30,7 @@ DSH 主进程 fetch / web_fetch / bash 子进程
         │  插件把宿主代理策略里的 http(s) 代理指向本地分流代理
         ▼
 本地分流代理(插件内置,只监听 127.0.0.1:17890)
-        ├── 命中 proxy 规则 → 上游代理(设置页里配的那个地址)
+        ├── 命中 proxy 规则 → 上游代理(配置页里配的那个地址)
         └── 其余(默认)     → 直连
 ```
 
@@ -53,37 +53,38 @@ dsh plugin --profile web add @yangzhe1991/dsh-proxy-router
 
 > 本地开发用 `link:` 装:在 `~/.dsh/profiles/web` 下把依赖改成 `"@yangzhe1991/dsh-proxy-router": "link:/path/to/repo"`,然后 `pnpm install` 并重启。
 
-## 设置页(推荐用法)
+## 配置页(推荐用法)
 
-重启后打开 **设置 → 插件 → 插件配置**,展开「代理分流(proxy-router)」卡片:
+重启后打开侧边栏 **Plugins** → 找到本插件包 `@yangzhe1991/dsh-proxy-router` →
+展开行 **proxy-router** → **Configure**(dsh 0.1.7 起插件配置就在这一页,设置页里只剩只读清单):
 
 | 字段 | 说明 |
 | --- | --- |
 | 上游代理 | 例如 `http://192.168.3.47:12801`;留空则沿用启动环境里的 `https_proxy` / `http_proxy` |
 | 未命中任何规则时 | `直连`(推荐)或 `走上游代理` |
-| 远程被墙清单 | 一行一个 URL;清空即不加载任何远程清单 |
 | 清单刷新周期 | 小时;`0` 表示只用手上已有的缓存 |
-| 本地分流代理监听地址 | 形如 `127.0.0.1:17890` |
+| 本地分流代理监听地址 | 形如 `127.0.0.1:17890`;端口 `0` = 让系统分配 |
 | 连接超时 | 毫秒;只作用于建立连接阶段,不影响流式响应 |
 | 上游失败时回退直连 | 走上游的连接失败时自动改用直连 |
 | 打印每次请求的分流日志 | 排查时打开,日志进宿主 stderr |
 
-卡片底部是**运行状态**:监听地址、上游及其来源、宿主策略是否已接管(以及 bash 子进程走没走分流)、规则条数、命中统计、本地规则文件路径、每条远程清单的条数与更新时间。
+卡片上半部是**运行状态**:监听地址、上游及其来源、宿主策略是否已接管(以及 bash 子进程走没走分流)、规则条数、命中统计、每条远程清单的条数与更新时间(本地规则文件路径在启动日志里)。
 
 几个要点:
 
-- **改完保存即时生效**,不用重启 dsh:上游、默认走向、超时、回退、调试开关都是现读的;改监听地址会立即重新绑定,并把宿主策略重新指过去。
-- 设置写到 `$DSH_HOME/settings.yaml`(默认 `~/.dsh/settings.yaml`)的 `proxy-router:` 分节;每个字段旁边有「恢复默认」,点了就把该字段从用户层删掉、回到组合配置/默认值。
-- 字段是否「已覆盖」只看它在不在用户层,与值本身无关;并发改动靠 revision 栅栏拒绝,不会静默覆盖。
+- **改完点保存即时生效**,不用重启 dsh:这些字段在插件 schema 里标了 `volatile`,宿主会把新值直接写进运行中的实例并发 `loader/volatile-update` —— 上游、默认走向、超时、回退、调试是现读的;改监听地址会立即重新绑定并把宿主策略指过去。
+- 保存写回的是 **profile 的用户层**(`~/.dsh/profiles/<profile>/cordis.patch.yml` 里那一行),它盖在组合配置(部署默认值)与 schema 默认值之上;每个字段旁边的「恢复默认」= 把该字段从用户层删掉。
+- 字段是否「已覆盖」只看它在不在用户层,与值本身无关;写入带 revision 栅栏,并发改动会被拒绝而不是静默覆盖。
+- `lists`(远程清单)与 `stateDir` / `rulesFile` 没标 volatile:**不在配置页里**,只能写在 profile 组合配置里(它们是部署事实,不是随手改的偏好)。
 
-> **⚠️ 在设置页配好上游之后,启动命令里就不要再 `export http_proxy/https_proxy/all_proxy` 了。**
+> **⚠️ 在配置页配好上游之后,启动命令里就不要再 `export http_proxy/https_proxy/all_proxy` 了。**
 > 宿主在启动阶段就把那三个变量的值定格成「bash 子进程要用」的一份快照,子进程会优先用它,
 > 于是 `curl`/`git`/`npm` 会绕过插件直接连你 export 的上游。插件检测到这种情况会在日志里明确告警,
 > 并在状态面板里把 bash 子进程标成「直连上游(绕过分流)」。
 
 ## 组合配置(部署默认值)
 
-设置页里的值是**用户层**,它盖在 profile 组合配置(部署默认值)之上。适合写在这里的是「这台机器上就长这样」的默认值,例如:
+配置页保存的值写进 **profile 用户层**;profile 组合配置(cordis.patch.yml 里那一行)是**部署默认值**,它盖在 schema 默认值之上。适合写在这里的是「这台机器上就长这样」的默认值,例如:
 
 ```yaml
 # ~/.dsh/profiles/web/cordis.patch.yml
@@ -93,18 +94,18 @@ dsh plugin --profile web add @yangzhe1991/dsh-proxy-router
     debug: false
 ```
 
-组合配置里还认两个只在部署层有意义的路径字段(不进设置页):
+还有两个只在部署层有意义的路径字段(不进配置页):
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `stateDir` | `~/.dsh/proxy-router` | 缓存与默认规则文件所在目录 |
 | `rulesFile` | `<stateDir>/rules.txt` | 本地规则文件路径 |
 
-设置页里的每个字段都可以写在组合配置里作为默认值;`lists` 在组合配置里既可以是 URL 字符串数组,也可以是 `{ name, url, route }` 对象(设置页会把它压平成 URL 列表)。
+配置页里的每个字段都可以写在组合配置里作为默认值;`lists` 既可以是 URL 字符串数组,也可以是 `{ name, url, route }` 对象(插件会把它压平成 URL 列表)。
 
 ## 本地规则:按经验增删
 
-文件默认在 `~/.dsh/proxy-router/rules.txt`,首次运行会自动生成带注释的模板。**改完立即生效**,不用重启 dsh(路径在设置页的状态面板里也能看到,但文件本身只能用编辑器改)。
+文件默认在 `~/.dsh/proxy-router/rules.txt`,首次运行会自动生成带注释的模板。**改完立即生效**,不用重启 dsh(文件本身只能用编辑器改)。
 
 ```txt
 # 每行一条,# 开头是注释;自上而下匹配,先命中者生效
@@ -133,7 +134,7 @@ curl -s "http://127.0.0.1:17890/__proxy-router/why?host=www.google.com"
 curl -s http://127.0.0.1:17890/__proxy-router/reload
 ```
 
-设置页那张卡片读的是同一个状态快照,走宿主 Web 服务器的同源只读路由 `GET /dsh-proxy-router/status`。
+配置页那张卡片读的是同一个状态快照,走宿主 Web 服务器的同源只读路由 `GET /dsh-proxy-router/status`。
 
 直接用 curl 验证分流效果:
 
@@ -142,7 +143,7 @@ curl -x http://127.0.0.1:17890 -sI https://www.google.com   # 走上游
 curl -x http://127.0.0.1:17890 -sI https://www.baidu.com    # 直连
 ```
 
-启动日志会打印上游来源、监听地址、规则条数、策略自检结果、设置页入口,以及「bash 子进程是否也走分流」。
+启动日志会打印上游来源、监听地址、规则条数、策略自检结果、配置页入口,以及「bash 子进程是否也走分流」。
 
 ## 健壮性
 
@@ -154,10 +155,11 @@ curl -x http://127.0.0.1:17890 -sI https://www.baidu.com    # 直连
 
 ## 兼容性
 
-- 自 **0.1.0** 起在 **dsh 0.1.5-rc.2** 上验证通过(0.1.1 的防自环修复同样验证于该版本)。
+- 自 **0.2.0** 起在 **dsh 0.1.7-rc.2** 上验证通过。
+- **dsh < 0.1.7 不再支持**:0.1.7 把插件配置从 `settings.yaml` + `ctx.settings.installSection` + 客户端的 `settingsScope`/`settings.plugin.item` 换成了「插件行 `Config` schema + Plugins 页槽位 + volatile 热更新」,本插件已按新契约实现。
 - 宿主半只依赖 `@deepseek-ai/dsh-http-proxy`、`@deepseek-ai/schemastery`、`undici` 的公开导出与 cordis 的 `ctx.get` / `ctx.effect` / `ctx.inject`;
   浏览器半只 require `react`,不依赖任何 UI 包。
-- 设置页用的是官方设置体系(`ctx.settings.installSection` + `settings.plugin.item` 槽位);
+- 配置页用的是官方设置体系(`Config` schema + `plugins.row.config` 槽位 + `ctx.configForms`);
   部署没挂设置提供方时,插件自动退回组合配置,其余功能不受影响。
 
 ## 已知边界
@@ -165,7 +167,7 @@ curl -x http://127.0.0.1:17890 -sI https://www.baidu.com    # 直连
 - **上游只支持 HTTP 代理**(`http://` / `https://`)。`all_proxy=socks5://…` 会被忽略并告警;如果你的代理同时提供混合端口(mihomo/clash 的 `mixed-port`),把 `http://host:port` 配给上游即可。
 - **不做 TLS 中间人**:https 只按 CONNECT 里的域名分流,不解析内容 —— 所以也无法按 URL 路径分流。
 - 规则只支持域名后缀、精确域名、关键字与 IP 字面量,不支持正则表达式。
-- 本地分流代理只监听 `127.0.0.1`,不对局域网暴露;本地规则文件不能在设置页里编辑(只显示路径)。
+- 本地分流代理只监听 `127.0.0.1`,不对局域网暴露;本地规则文件不能在配置页里编辑(启动日志会打印它的路径)。
 
 ## License
 

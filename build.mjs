@@ -20,7 +20,7 @@ import { build } from 'esbuild'
 const PLUGIN_ID = '@yangzhe1991/dsh-proxy-router'
 
 // 浏览器半的 externals:必须是平台模块表成员,否则 require 会在运行时抛错。
-// 本插件的卡片只用 react(hooks + jsx-runtime),UI 样式全部用 DSW css 变量自带。
+// 卡片用到 react(hooks + jsx-runtime)与 primitives 的设置表单;UI 样式全部用 DSW css 变量。
 const CLIENT_EXTERNALS = [
   'react',
   'react/jsx-runtime',
@@ -28,6 +28,9 @@ const CLIENT_EXTERNALS = [
   'react-dom/client',
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-slots',
+  // 设置表单的共享实现(表单模型 / 字段控件 / 表单外壳)随平台模块表提供,
+  // 插件只能 require,不能自带一份副本 —— 否则与官方设置页的样式/行为劈叉。
+  '@deepseek-ai/dsh-client-ui-primitives',
 ]
 
 // —— node 半 ——

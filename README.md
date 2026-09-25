@@ -30,7 +30,7 @@ DSH main process fetch / web_fetch / bash subprocesses
         │  the plugin repoints the host's http(s) proxy at the local router
         ▼
 Local routing proxy (built in, bound to 127.0.0.1:17890)
-        ├── matches a proxy rule → upstream proxy (the address from the settings page)
+        ├── matches a proxy rule → upstream proxy (the address from the configuration page)
         └── everything else (default) → direct connection
 ```
 
@@ -53,9 +53,9 @@ Then restart `dsh web`.
 
 > For local development, install with `link:`: set `"@yangzhe1991/dsh-proxy-router": "link:/path/to/repo"` in `~/.dsh/profiles/web`, run `pnpm install`, restart.
 
-## Settings page (the recommended way)
+## Configuration page (the recommended way)
 
-After the restart, open **Settings → Plugins → Plugin configuration** and expand the "代理分流 (proxy-router)" card:
+After the restart, open **Plugins** in the sidebar → find this bundle → expand the **proxy-router** row → **Configure** (since dsh 0.1.7 plugin configuration lives on that page; Settings keeps a read-only inventory):
 
 | Field | Meaning |
 | --- | --- |
@@ -73,7 +73,7 @@ Below the fields sits a live **status panel**: bind address, upstream and where 
 Worth knowing:
 
 - **Saving takes effect immediately** — no dsh restart. Upstream, default route, timeout, fallback and debug are read per request; changing the bind address re-binds the listener and repoints the host policy at it.
-- Settings are written to the `proxy-router:` section of `$DSH_HOME/settings.yaml` (default `~/.dsh/settings.yaml`). Each field has a "reset" action that removes the user-layer entry, falling back to the composition default.
+- Settings are written to the **profile's user layer** (the row's `config:` in `~/.dsh/profiles/<profile>/cordis.patch.yml`), over the composition layer and the schema defaults. Each field has a "reset" action that removes the user-layer entry, falling back to the composition default.
 - A field counts as overridden purely by its presence in the user layer; concurrent writes are fenced by revision instead of silently overwriting each other.
 
 > **⚠️ Once the upstream is configured here, stop exporting `http_proxy` / `https_proxy` / `all_proxy` in your launch command.**
@@ -83,7 +83,7 @@ Worth knowing:
 
 ## Composition config (deployment defaults)
 
-The settings page writes the **user layer**, which resolves above the profile's composition config (the deployment default). Put machine-wide defaults there:
+Saving the card writes the **profile's user layer**; the profile's composition config (the row's `config:` in `cordis.patch.yml`) is the **deployment default** and resolves above the schema defaults. Put machine-wide defaults there:
 
 ```yaml
 # ~/.dsh/profiles/web/cordis.patch.yml
@@ -100,11 +100,11 @@ Two path-shaped fields stay composition-only (they are deployment facts, not pre
 | `stateDir` | `~/.dsh/proxy-router` | cache and default rules file location |
 | `rulesFile` | `<stateDir>/rules.txt` | local rules file path |
 
-Every settings field may also be written here as a default; in composition config `lists` accepts plain URL strings or `{ name, url, route }` objects (the settings page flattens them to a URL list).
+Every editable field may also be written here as a default; `lists` accepts plain URL strings or `{ name, url, route }` objects (the plugin flattens them to a URL list).
 
 ## Local rules
 
-The file lives at `~/.dsh/proxy-router/rules.txt`; a commented template is created on first run. **Edits take effect immediately** — no dsh restart. The settings page shows the path and the current rule count, but editing happens in your editor.
+The file lives at `~/.dsh/proxy-router/rules.txt`; a commented template is created on first run. **Edits take effect immediately** — no dsh restart. The path shows up in the startup log; editing happens in your editor.
 
 ```txt
 # one rule per line, '#' starts a comment; first match wins
@@ -142,7 +142,7 @@ curl -x http://127.0.0.1:17890 -sI https://www.google.com   # via upstream
 curl -x http://127.0.0.1:17890 -sI https://www.baidu.com    # direct
 ```
 
-The startup log prints the upstream and its source, the bind address, rule counts, the policy self-check result, the settings-page entry point, and whether bash subprocesses are routed too.
+The startup log prints the upstream and its source, the bind address, rule counts, the policy self-check result, the configuration-page entry point, and whether bash subprocesses are routed too.
 
 ## Robustness
 
@@ -152,7 +152,8 @@ The startup log prints the upstream and its source, the bind address, rule count
 
 ## Compatibility
 
-- Verified against **dsh 0.1.5-rc.2** since **0.1.0** (the 0.1.1 self-loop fix is verified on that same version).
+- Verified against **dsh 0.1.7-rc.2** since **0.2.0**.
+- **dsh < 0.1.7 is not supported**: 0.1.7 replaced plugin configuration (`settings.yaml` + `ctx.settings.installSection` + the client's `settingsScope` / `settings.plugin.item`) with a row-level `Config` schema, the Plugins page slots, and volatile live updates; this plugin implements the new contract.
 - The host half depends only on the public exports of `@deepseek-ai/dsh-http-proxy`, `@deepseek-ai/schemastery` and `undici`, plus cordis' `ctx.get` / `ctx.effect` / `ctx.inject`; the browser half requires only `react` and no UI package.
 - The settings card uses the official settings system (`ctx.settings.installSection` + the `settings.plugin.item` slot). On a deployment without a settings provider the plugin falls back to its composition config and everything else keeps working.
 
@@ -161,7 +162,7 @@ The startup log prints the upstream and its source, the bind address, rule count
 - **HTTP proxies only** (`http://` / `https://`). `all_proxy=socks5://…` is ignored with a warning; if your proxy also exposes a mixed port (mihomo/clash `mixed-port`), point the upstream at `http://host:port`.
 - **No TLS interception**: https is routed by the CONNECT hostname only, so URL-path rules are impossible by design.
 - Rules support domain suffixes, exact domains, keywords and IP literals — no regular expressions.
-- The local router binds `127.0.0.1` only; it is not exposed to the LAN, and the local rules file is not editable from the settings page (its path is shown there).
+- The local router binds `127.0.0.1` only; it is not exposed to the LAN, and the local rules file is not editable from the configuration page (the startup log prints its path).
 
 ## License
 

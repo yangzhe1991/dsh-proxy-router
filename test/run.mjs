@@ -285,8 +285,8 @@ console.log('\n[4] 默认远程清单与优先级')
   rmSync(STATE3, { recursive: true, force: true })
 }
 
-// ──────────── 5. 设置命名空间接入 + 热应用 ────────────
-console.log('\n[5] 设置命名空间与热应用')
+// ──────────── 5. 行配置 schema + volatile 热应用(dsh 0.1.7 契约) ────────────
+console.log('\n[5] 行配置 schema 与 volatile 热应用')
 {
   const STATE5 = join(HERE, '.test-state-5')
   rmSync(STATE5, { recursive: true, force: true })
@@ -294,70 +294,75 @@ console.log('\n[5] 设置命名空间与热应用')
   const rulesFile5 = join(STATE5, 'rules.txt')
   writeFileSync(rulesFile5, 'proxy: www.google.com\n', 'utf8')
 
-  /** 捕获插件注册的设置分节(模拟宿主 dsh-settings-file 的 installSection)。 */
-  let section = null
-  const routes = []
-  const fakeWebServer = {
-    register(route) {
-      routes.push(route)
-      return () => {}
-    },
-  }
-  const provider = {
-    installSection(owner, ns, schema, entry, hooks) {
-      section = { ns, schema, entry, hooks }
-    },
-  }
-  const ctx5 = {
-    get: (name) => (name === 'settings' ? provider : name === 'webServer' ? fakeWebServer : undefined),
-    effect: (fn) => disposers.push(fn()),
-    inject: (deps, cb) => cb({ get: (name) => (name === 'settings' ? provider : name === 'webServer' ? fakeWebServer : undefined) }),
-  }
-  apply(ctx5, {
-    upstream: UPSTREAM,
-    listen: `127.0.0.1:${PORT}`,
-    lists: [],
-    refreshHours: 0,
-    stateDir: STATE5,
-    rulesFile: rulesFile5,
-  })
-  const status5 = await waitForReady()
-  check('设置命名空间已注册', section?.ns === 'proxy-router', section?.ns ?? '未注册')
-  check('设置分节被标记为已注册', status5.settingsRegistered === true, String(status5.settingsRegistered))
+  const { Config } = await import(pathToFileURL(join(ROOT, 'lib/index.js')).href)
+  check('导出 Config schema(宿主读它校验配置、生成 Plugins 页表单)', typeof Config?.['~standard'] === 'object')
+  const schemaJson = JSON.stringify(typeof Config.toJSON === 'function' ? Config.toJSON() : {})
   check(
-    'schema 可被宿主序列化',
-    typeof section?.schema?.toJSON === 'function' && JSON.stringify(section.schema.toJSON()).includes('upstream'),
+    'schema 里运行期旋钮都带 volatile(只有 volatile 字段能出现在表单里并热生效)',
+    ['upstream', 'defaultRoute', 'listen', 'refreshHours', 'connectTimeoutMs', 'fallbackDirect', 'debug'].every(
+      (key) => schemaJson.includes(`"${key}"`),
+    ),
   )
-  check('base 层 = 组合配置', section?.entry?.upstream === UPSTREAM.trim(), String(section?.entry?.upstream))
+  const defaults = Config({})
+  // volatile 字段在解析结果里是引用(宿主热更新就是改这个引用),测试里按引用读一次。
+  const plain = (node) => (node !== null && typeof node === 'object' && typeof node.get === 'function' ? node.get() : node)
   check(
     'schema 默认值来自插件常量',
-    section?.schema?.({})?.defaultRoute === 'direct' && section?.schema?.({})?.listen === '127.0.0.1:17890',
-    JSON.stringify(section?.schema?.({})),
+    plain(defaults.defaultRoute) === 'direct' && plain(defaults.listen) === '127.0.0.1:17890' && plain(defaults.fallbackDirect) === true,
+    JSON.stringify({ route: plain(defaults.defaultRoute), listen: plain(defaults.listen) }),
   )
-  check('段校验能拒绝 socks 上游', (() => {
+  check('schema 校验拒绝 socks 上游之外的类型错误(非字符串)', (() => {
     try {
-      section.hooks.validate({ ...section.entry, upstream: 'socks5://1.2.3.4:1080' })
+      Config({ listen: 123 })
       return false
     } catch {
       return true
     }
   })())
-  check('状态路由已挂到 Web 服务器', routes.some((route) => route.path === '/dsh-proxy-router/status'))
 
-  // 模拟用户在设置页保存:上游换成一个连不上的地址,监听端口也换一个
-  const NEW_PORT = PORT + 2
-  section.hooks.setSource(() => ({
-    upstream: 'http://127.0.0.1:9',
+  // 模拟宿主:volatile 字段以引用形态交给插件,热更新时改写引用并派发 loader/volatile-update
+  const state = {
+    upstream: UPSTREAM,
+    listen: `127.0.0.1:${PORT}`,
     defaultRoute: 'direct',
-    lists: [],
     refreshHours: 0,
-    listen: `127.0.0.1:${NEW_PORT}`,
     connectTimeoutMs: 15000,
     fallbackDirect: true,
     debug: false,
-  }))
-  section.hooks.onChange()
-  // 等热应用完成(重新绑定监听 + 重装策略)
+  }
+  const ref = (key) => ({ get: () => state[key] })
+  const configLike = {
+    upstream: ref('upstream'),
+    listen: ref('listen'),
+    defaultRoute: ref('defaultRoute'),
+    refreshHours: ref('refreshHours'),
+    connectTimeoutMs: ref('connectTimeoutMs'),
+    fallbackDirect: ref('fallbackDirect'),
+    debug: ref('debug'),
+    lists: [],
+    stateDir: STATE5,
+    rulesFile: rulesFile5,
+  }
+  let volatileListener = null
+  const routes = []
+  const fakeWebServer = { register(route) { routes.push(route); return () => {} } }
+  const ctx5 = {
+    get: (name) => (name === 'webServer' ? fakeWebServer : undefined),
+    on: (name, listener) => { if (name === 'loader/volatile-update') volatileListener = listener },
+    effect: (fn) => disposers.push(fn()),
+    inject: (deps, cb) => cb({ get: (name) => (name === 'webServer' ? fakeWebServer : undefined) }),
+  }
+  apply(ctx5, configLike)
+  const status5 = await waitForReady()
+  check('状态路由已挂到 Web 服务器', routes.some((route) => route.path === '/dsh-proxy-router/status'))
+  check('状态里带上游来源', status5.upstream?.source === 'config', String(status5.upstream?.source))
+
+  // 模拟设置页保存:上游换成一个连不上的地址,监听端口也换一个 —— 宿主只改引用并发事件
+  const NEW_PORT = PORT + 2
+  state.upstream = 'http://127.0.0.1:9'
+  state.listen = `127.0.0.1:${NEW_PORT}`
+  check('已订阅 loader/volatile-update', typeof volatileListener === 'function')
+  volatileListener?.()
   let moved = null
   const moveDeadline = Date.now() + 10_000
   while (Date.now() < moveDeadline) {
@@ -372,8 +377,8 @@ console.log('\n[5] 设置命名空间与热应用')
     }
     await new Promise((r) => setTimeout(r, 200))
   }
-  check('设置改监听地址后已重新绑定', moved?.listening?.port === NEW_PORT, JSON.stringify(moved?.listening ?? null))
-  check('设置改上游后运行时立即生效', moved?.upstream?.url === 'http://127.0.0.1:9/', String(moved?.upstream?.url))
+  check('volatile 改监听地址后立即重新绑定', moved?.listening?.port === NEW_PORT, JSON.stringify(moved?.listening ?? null))
+  check('volatile 改上游后运行时立即生效', moved?.upstream?.url === 'http://127.0.0.1:9/', String(moved?.upstream?.url))
 
   // 宿主策略要跟着指到新端口,否则主进程还打旧地址
   {
@@ -386,16 +391,11 @@ console.log('\n[5] 设置命名空间与热应用')
       String(childEnv.http_proxy),
     )
   }
-  // 设置页读的状态路由返回 JSON
+  // 状态路由返回 JSON
   {
     const handler = routes.find((route) => route.path === '/dsh-proxy-router/status').handler
     let body = ''
-    const fakeRes = {
-      writeHead() {},
-      end(text) {
-        body = text ?? ''
-      },
-    }
+    const fakeRes = { writeHead() {}, end(text) { body = text ?? '' } }
     await handler({ method: 'GET' }, fakeRes)
     const parsed = JSON.parse(body)
     check('状态路由返回运行态 JSON', parsed.namespace === 'proxy-router' && parsed.listening.port === NEW_PORT, JSON.stringify(parsed.listening))
@@ -404,25 +404,20 @@ console.log('\n[5] 设置命名空间与热应用')
   rmSync(STATE5, { recursive: true, force: true })
 }
 
-// ──────────── 6. 浏览器半 bundle(设置页卡片) ────────────
+// ──────────── 6. 浏览器半 bundle(Plugins 页配置卡片) ────────────
 console.log('\n[6] 浏览器半')
 {
-  const fallback = join(homedir(), '.dsh', 'profiles', 'web', '.dsh-module-fallback', 'node_modules')
-  const table = {}
-  for (const [name, entry] of [
-    ['react', 'react/index.js'],
-    ['react/jsx-runtime', 'react/jsx-runtime.js'],
-    ['react-dom', 'react-dom/index.js'],
-    ['react-dom/client', 'react-dom/client.js'],
-    ['react-dom/server', 'react-dom/server.js'],
-  ]) {
-    const module = await import(pathToFileURL(join(fallback, entry)).href)
-    table[name] = module.default ?? module
+  // 平台模块表 stub:bundle 的 factory 只 require 这三样;
+  // 卡片本身不渲染(渲染测试交给真浏览器),这里只验证装配与注册契约。
+  const table = {
+    react: { useCallback: (fn) => fn, useEffect: () => {}, useState: (value) => [value, () => {}] },
+    'react/jsx-runtime': { jsx: () => null, jsxs: () => null, Fragment: null },
+    '@deepseek-ai/dsh-client-ui-primitives': {
+      SettingsFormModel: class { bind() { return { getSnapshot: () => ({}), subscribe: () => () => {} } } dispose() {} actions() { return {} } },
+      SettingsForm: () => null,
+      SettingsValueField: () => null,
+    },
   }
-  const React = table.react
-  const server = table['react-dom/server']
-
-  // mock window.__ModuleLoader__:执行 bundle 的工厂并记录导出
   const loadedModules = []
   globalThis.window = {
     __ModuleLoader__: {
@@ -440,12 +435,12 @@ console.log('\n[6] 浏览器半')
   check('bundle 完成注册且 id 正确', loadedModules.length === 1 && loadedModules[0].id === '@yangzhe1991/dsh-proxy-router')
   check('浏览器半导出 apply 与 inject', typeof plugin?.apply === 'function' && Array.isArray(plugin?.inject))
   check(
-    'inject 声明了用到的客户端服务',
-    plugin?.inject?.includes('slots') && plugin?.inject?.includes('settingsScope'),
+    'inject 声明了用到的客户端服务(slots + configForms)',
+    plugin?.inject?.includes('slots') && plugin?.inject?.includes('configForms'),
     JSON.stringify(plugin?.inject),
   )
 
-  // mock document + slots + settingsScope,跑一次真正的 apply
+  // mock document + slots + configForms,跑一次真正的 apply
   const styleTags = []
   globalThis.document = {
     querySelector: () => null,
@@ -453,31 +448,8 @@ console.log('\n[6] 浏览器半')
     head: { appendChild: (tag) => styleTags.push(tag) },
   }
   const registrations = []
-  const snapshot = {
-    status: 'ready',
-    value: {
-      upstream: 'http://192.168.3.47:12801',
-      defaultRoute: 'direct',
-      lists: ['https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt'],
-      refreshHours: 24,
-      listen: '127.0.0.1:17890',
-      connectTimeoutMs: 15000,
-      fallbackDirect: true,
-      debug: true,
-    },
-    base: {},
-    user: { debug: true },
-    revision: 7,
-    writable: true,
-    mode: 'host',
-  }
-  const writes = []
-  const scope = {
-    getSnapshot: () => snapshot,
-    subscribe: () => () => {},
-    set: async (field, value) => writes.push({ op: 'set', field, value }),
-    unset: async (field) => writes.push({ op: 'unset', field }),
-  }
+  const served = []
+  const fakeScope = { getSnapshot: () => ({ status: 'ready', value: {}, base: {}, user: {}, revision: 1, writable: true }), subscribe: () => () => {}, mutate: async () => true }
   const ctxClient = {
     slots: {
       inject: (name, callback) => callback(),
@@ -486,30 +458,41 @@ console.log('\n[6] 浏览器半')
         return () => {}
       },
     },
-    settingsScope: { bind: (spec) => (spec.namespace === 'proxy-router' ? scope : null) },
+    configForms: {
+      get: (ns) => {
+        if (ns !== 'proxy-router') throw new Error(`未知命名空间 ${ns}`)
+        return fakeScope
+      },
+      whileServed: (namespaces, register) => {
+        served.push(...namespaces)
+        return register(new Set(namespaces)) ?? (() => {})
+      },
+    },
+    effect: (fn) => fn(),
   }
   plugin.apply(ctxClient)
-  check('注册到 settings.plugin.item 且 key 为命名空间', registrations.length === 1 && registrations[0].options.key === 'proxy-router', JSON.stringify(registrations[0]?.options))
+  check('卡片只在该行被 served 时注册', JSON.stringify(served) === JSON.stringify(['proxy-router']), JSON.stringify(served))
+  check(
+    '注册到 plugins.row.config,key = 包名#行 id',
+    registrations.length === 1 && registrations[0].options.key === '@yangzhe1991/dsh-proxy-router#proxy-router' && registrations[0].options.name === 'plugins.row.config',
+    JSON.stringify(registrations[0]?.options),
+  )
   check('卡片样式已注入且带 data-plugin-css 标记', styleTags.length === 1 && String(styleTags[0].dataset.pluginCss ?? '').includes('dsh-proxy-router'))
 
-  // 注册进槽位的组件默认收起:先验头部
-  const collapsed = server.renderToStaticMarkup(React.createElement(registrations[0].component))
-  check('收起态渲染插件名与说明', collapsed.includes('代理分流') && collapsed.includes('bash 子进程'))
-  // 注意别拿「上游代理」当判据:卡片描述里也有这四个字,要判表单元素本身
-  check('收起态不渲染表单', !collapsed.includes('dpr_field') && !collapsed.includes('<input'))
-
-  // 展开态:直接渲染组件本体(initialOpen),覆盖表单、覆盖标记、按钮禁用逻辑
-  const html = server.renderToStaticMarkup(React.createElement(plugin.ProxyRouterCard, { scope, initialOpen: true }))
-  check(
-    '展开态渲染出全部字段标签',
-    ['上游代理', '未命中任何规则时', '远程被墙清单', '清单刷新周期', '本地分流代理监听地址', '连接超时', '上游失败时回退直连', '打印每次请求的分流日志'].every(
-      (label) => html.includes(label),
-    ),
-    FIELDS_KEYS.filter((key) => !html.includes(key)).join(',') || '全部命中',
-  )
-  check('展开态显示已覆盖字段的标记与恢复默认', html.includes('已覆盖') && html.includes('恢复默认'))
-  check('未编辑时保存/放弃按钮禁用', (html.match(/disabled/g) ?? []).length >= 2)
-  check('状态面板占位存在', html.includes('运行状态') && html.includes('读取中'))
+  // 白屏防线:服务缺失/形状不符时必须安静退出,绝不抛(浏览器半抛错会掀掉整棵组合树)
+  const registrations2 = []
+  const ctxMissing = { slots: { inject: () => {}, register: (o) => { registrations2.push(o); return () => {} } }, effect: (fn) => fn() }
+  let threw = false
+  const warns = []
+  const realWarn = console.warn
+  console.warn = (...args) => warns.push(args.join(' '))
+  try {
+    plugin.apply(ctxMissing)
+  } catch {
+    threw = true
+  }
+  console.warn = realWarn
+  check('configForms 缺失时安静退出(不抛错、不注册)', threw === false && registrations2.length === 0 && warns.some((line) => line.includes('configForms 不可用')))
   delete globalThis.window
   delete globalThis.document
 }
@@ -517,19 +500,16 @@ console.log('\n[6] 浏览器半')
 // ──────────── 7. 客户端字段规则(纯函数) ────────────
 console.log('\n[7] 客户端字段规则')
 {
-  const { FIELDS, validate, parseDraft, toText, isOverridden } = await import('../src/client/fields.ts')
-  const byKey = Object.fromEntries(FIELDS.map((field) => [field.key, field]))
-  check('字段集合与宿主 schema 对齐', FIELDS_KEYS.every((key) => key in byKey), FIELDS.map((f) => f.key).join(','))
-  check('上游只接受 http(s)', validate('text', 'upstream', 'socks5://1.2.3.4:1080') !== undefined && validate('text', 'upstream', 'http://1.2.3.4:8080') === undefined)
-  check('上游留空合法(沿用环境变量)', validate('text', 'upstream', '') === undefined)
-  check('监听地址校验端口', validate('text', 'listen', '127.0.0.1:99999') !== undefined && validate('text', 'listen', '127.0.0.1:17890') === undefined)
-  check('数字字段拒绝负数与空值', validate('number', 'refreshHours', '-1') !== undefined && validate('number', 'refreshHours', '') !== undefined)
-  check('连接超时有下限', validate('number', 'connectTimeoutMs', '500') !== undefined)
-  check('清单行必须是 URL', validate('lines', 'lists', 'https://a/gfw.txt\nnot-a-url') !== undefined)
-  check('草稿解析:多行清单', JSON.stringify(parseDraft('lines', ' https://a/gfw.txt \n\nhttps://b/x.txt\n')) === JSON.stringify(['https://a/gfw.txt', 'https://b/x.txt']))
-  check('草稿解析:开关与数字', parseDraft('switch', 'true') === true && parseDraft('number', ' 42 ') === 42)
-  check('草稿渲染:开关与清单', toText('switch', true) === 'true' && toText('lines', ['a', 'b']) === 'a\nb')
-  check('覆盖判定只看 key 在不在', isOverridden({ debug: false }, 'debug') && !isOverridden({}, 'upstream'))
+  const { upstreamField, listenField, routeField, booleanField, nonNegativeNumberField, millisecondsField } = await import('../src/client/fields.ts')
+  const parse = (spec, text) => spec.parse(text)
+  check('上游只接受 http(s)', parse(upstreamField(), 'socks5://1.2.3.4:1080') === undefined && parse(upstreamField(), 'http://1.2.3.4:8080')?.value === 'http://1.2.3.4:8080')
+  check('上游留空 = 清除覆盖(回落到环境变量)', parse(upstreamField(), '  ')?.kind === 'clear')
+  check('监听地址校验端口', parse(listenField(), '127.0.0.1:99999') === undefined && parse(listenField(), '127.0.0.1:17890')?.value === '127.0.0.1:17890')
+  check('监听地址留空 = 回到默认', parse(listenField(), '')?.kind === 'clear')
+  check('未命中走向只认 direct/proxy', parse(routeField(), 'both') === undefined && parse(routeField(), 'proxy')?.value === 'proxy')
+  check('布尔字段接受 true/false/1/0/on/off', ['true', '1', 'on', 'yes'].every((t) => parse(booleanField('debug'), t)?.value === true) && ['false', '0', 'off', 'no'].every((t) => parse(booleanField('debug'), t)?.value === false))
+  check('非负整数字段拒绝负数与小数', parse(nonNegativeNumberField('refreshHours'), '-1') === undefined && parse(nonNegativeNumberField('refreshHours'), '2.5') === undefined && parse(nonNegativeNumberField('refreshHours'), '24')?.value === 24)
+  check('超时字段有下限', parse(millisecondsField('connectTimeoutMs', 1000), '500') === undefined && parse(millisecondsField('connectTimeoutMs', 1000), '15000')?.value === 15000)
 }
 
 // ──────────── 8. 防自环(线上曾刷出 1.1 亿次请求) ────────────

@@ -1,151 +1,16 @@
 /**
- * 配置卡片用到的字段定义与纯函数(取值、格式化、校验、反解析)。
+ * 配置卡片用到的字段定义与纯函数。
  *
- * 刻意把「怎么显示 / 怎么校验 / 怎么把文本变成设置值」放在这里而不是组件里:
- * 这些规则可以直接单测,组件只负责渲染与交互。
+ * dsh 0.1.7 的设置表单契约(`@deepseek-ai/dsh-client-ui-primitives` 的
+ * `SettingsFormModel`)把「字段怎么显示 / 怎么校验 / 文本怎么变回设置值」
+ * 收进 `SettingsFieldSpec`;primitives 只自带 text/number 两个 spec,
+ * 上游地址、监听地址、布尔开关这些本插件特有的规则写在下面,
+ * 组件只负责渲染。
  */
+import type { SettingsFieldSpec, SettingsFieldWrite } from '@deepseek-ai/dsh-client-ui-primitives'
 
-/** 一个字段的渲染与解析规则。 */
-export interface FieldSpec {
-  /** 设置命名空间里的字段名。 */
-  key: string
-  label: string
-  hint: string
-  kind: 'text' | 'number' | 'switch' | 'choice' | 'lines'
-  /** choice 类型的可选项。 */
-  choices?: { value: string; label: string }[]
-}
-
-/** 卡片上的全部字段(顺序即渲染顺序)。 */
-export const FIELDS: FieldSpec[] = [
-  {
-    key: 'upstream',
-    label: '上游代理',
-    hint: '例如 http://192.168.3.47:12801;留空则沿用启动环境里的 https_proxy / http_proxy',
-    kind: 'text',
-  },
-  {
-    key: 'defaultRoute',
-    label: '未命中任何规则时',
-    hint: '推荐「直连」:只有清单/本地规则命中的被墙域名才走上游代理',
-    kind: 'choice',
-    choices: [
-      { value: 'direct', label: '直连' },
-      { value: 'proxy', label: '走上游代理' },
-    ],
-  },
-  {
-    key: 'lists',
-    label: '远程被墙清单',
-    hint: '一行一个 URL;命中的域名走上游代理。清空即不加载任何远程清单',
-    kind: 'lines',
-  },
-  {
-    key: 'refreshHours',
-    label: '清单刷新周期(小时)',
-    hint: '0 表示不自动刷新,只用手上已有的缓存',
-    kind: 'number',
-  },
-  {
-    key: 'listen',
-    label: '本地分流代理监听地址',
-    hint: '形如 127.0.0.1:17890;改动会立即重新绑定,并把宿主策略指过去',
-    kind: 'text',
-  },
-  {
-    key: 'connectTimeoutMs',
-    label: '连接超时(毫秒)',
-    hint: '建立 TCP/上游连接的上限;不影响已建立的隧道与流式响应',
-    kind: 'number',
-  },
-  {
-    key: 'fallbackDirect',
-    label: '上游失败时回退直连',
-    hint: '走上游的连接失败时自动改用直连(客户端还没收到任何字节时才可能回退)',
-    kind: 'switch',
-  },
-  {
-    key: 'debug',
-    label: '打印每次请求的分流日志',
-    hint: '在宿主 stderr 输出一行 CONNECT/GET → direct|proxy,排查时打开',
-    kind: 'switch',
-  },
-]
-
-/** 把设置值渲染成控件里的文本。 */
-export function toText(kind: FieldSpec['kind'], value: unknown): string {
-  if (kind === 'lines') {
-    if (!Array.isArray(value)) return ''
-    return value.filter((entry) => typeof entry === 'string').join('\n')
-  }
-  if (kind === 'switch') return value === true ? 'true' : 'false'
-  if (value === undefined || value === null) return ''
-  return String(value)
-}
-
-/**
- * 校验一段草稿文本。
- * @returns 错误文案;`undefined` 表示这段草稿可以保存。
- */
-export function validate(kind: FieldSpec['kind'], key: string, text: string): string | undefined {
-  switch (kind) {
-    case 'text': {
-      if (key === 'upstream') {
-        const trimmed = text.trim()
-        if (trimmed === '') return undefined
-        if (!/^https?:\/\//i.test(trimmed)) return '只支持 http:// 或 https:// 的代理地址'
-        return undefined
-      }
-      if (key === 'listen') {
-        const trimmed = text.trim()
-        if (!/^[^\s:]+:\d{1,5}$/.test(trimmed)) return '形如 127.0.0.1:17890'
-        const port = Number(trimmed.slice(trimmed.lastIndexOf(':') + 1))
-        if (!Number.isInteger(port) || port < 0 || port > 65535) return '端口需要在 0-65535 之间'
-        return undefined
-      }
-      return undefined
-    }
-    case 'number': {
-      const trimmed = text.trim()
-      if (trimmed === '' || !/^\d+$/.test(trimmed)) return '需要一个非负整数'
-      const value = Number(trimmed)
-      if (key === 'connectTimeoutMs' && value < 1000) return '至少 1000 毫秒'
-      return undefined
-    }
-    case 'lines': {
-      const bad = text
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line !== '')
-        .find((line) => !/^https?:\/\//i.test(line))
-      return bad === undefined ? undefined : `不是合法 URL:${bad}`
-    }
-    default:
-      return undefined
-  }
-}
-
-/** 把草稿文本变成要写进设置文档的值(调用前必须已通过 {@link validate})。 */
-export function parseDraft(kind: FieldSpec['kind'], text: string): unknown {
-  switch (kind) {
-    case 'switch':
-      return text === 'true'
-    case 'number':
-      return Number(text.trim())
-    case 'lines':
-      return text
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line !== '')
-    default:
-      return text.trim()
-  }
-}
-
-/** 设置文档里的 user 层是否覆盖了这个字段(覆盖与值无关,只看 key 在不在)。 */
-export function isOverridden(user: unknown, key: string): boolean {
-  return typeof user === 'object' && user !== null && Object.prototype.hasOwnProperty.call(user, key)
-}
+/** 宿主挂的只读状态路由(卡片读它显示运行态;同源,无 CORS)。 */
+export const STATUS_PATH = '/dsh-proxy-router/status'
 
 /** 状态接口返回的形状(只取卡片要显示的部分)。 */
 export interface HostStatus {
@@ -160,4 +25,117 @@ export interface HostStatus {
   lists?: { name: string; count: number; fetchedAt: string | null; stale: boolean; lastError: string | null }[]
   stats?: { total: number; direct: number; proxied: number; failed: number; fallback: number } | null
   policy?: { verified: boolean; childRouting: 'router' | 'upstream' | 'none'; modulePath: string } | null
+}
+
+/** 读一个设置值成草稿文本;缺省用空串表示「没有覆盖」。 */
+function textOf(value: unknown): string {
+  if (value === undefined || value === null) return ''
+  return String(value)
+}
+
+/**
+ * 上游代理字段:空草稿 = 清除覆盖(回落到环境变量/默认)。
+ * 非空时必须是 http(s) 代理:写错格式就标红并拦住保存,而不是静默写进配置。
+ */
+export function upstreamField(): SettingsFieldSpec {
+  return {
+    field: 'upstream',
+    format: textOf,
+    parse: (text): SettingsFieldWrite | undefined => {
+      const trimmed = text.trim()
+      if (trimmed === '') return { kind: 'clear' }
+      if (!/^https?:\/\//i.test(trimmed)) return undefined
+      try {
+        const parsed = new URL(trimmed)
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined
+      } catch {
+        return undefined
+      }
+      return { kind: 'set', value: trimmed }
+    },
+  }
+}
+
+/**
+ * 监听地址字段:`host:port`,空草稿 = 清除覆盖(回到默认 127.0.0.1:17890)。
+ * 端口 0 表示「让系统分配」(排查时有用),所以 0 是合法的。
+ */
+export function listenField(): SettingsFieldSpec {
+  return {
+    field: 'listen',
+    format: textOf,
+    parse: (text): SettingsFieldWrite | undefined => {
+      const trimmed = text.trim()
+      if (trimmed === '') return { kind: 'clear' }
+      const at = trimmed.lastIndexOf(':')
+      if (at <= 0) return undefined
+      const host = trimmed.slice(0, at).trim()
+      const port = Number(trimmed.slice(at + 1))
+      if (host === '' || !/^\d{1,5}$/.test(trimmed.slice(at + 1))) return undefined
+      if (!Number.isInteger(port) || port < 0 || port > 65535) return undefined
+      return { kind: 'set', value: `${host}:${port}` }
+    },
+  }
+}
+
+/** 未命中规则时的走向:只认 direct / proxy(空草稿 = 清除覆盖)。 */
+export function routeField(): SettingsFieldSpec {
+  return {
+    field: 'defaultRoute',
+    format: (value) => (value === undefined || value === null ? '' : String(value)),
+    parse: (text): SettingsFieldWrite | undefined => {
+      const trimmed = text.trim().toLowerCase()
+      if (trimmed === '') return { kind: 'clear' }
+      if (trimmed !== 'direct' && trimmed !== 'proxy') return undefined
+      return { kind: 'set', value: trimmed }
+    },
+  }
+}
+
+/**
+ * 布尔字段(direct / proxy 之外的那些开关)。
+ * 接受 true/false/1/0/on/off(大小写不敏感);空草稿 = 清除覆盖。
+ */
+export function booleanField(field: string): SettingsFieldSpec {
+  return {
+    field,
+    format: (value) => (typeof value === 'boolean' ? (value ? 'true' : 'false') : ''),
+    parse: (text): SettingsFieldWrite | undefined => {
+      const trimmed = text.trim().toLowerCase()
+      if (trimmed === '') return { kind: 'clear' }
+      if (['true', '1', 'on', 'yes'].includes(trimmed)) return { kind: 'set', value: true }
+      if (['false', '0', 'off', 'no'].includes(trimmed)) return { kind: 'set', value: false }
+      return undefined
+    },
+  }
+}
+
+/** 非负整数字段(refreshHours:0 表示不自动刷新)。 */
+export function nonNegativeNumberField(field: string): SettingsFieldSpec {
+  return {
+    field,
+    format: (value) => (value === undefined || value === null ? '' : String(value)),
+    parse: (text): SettingsFieldWrite | undefined => {
+      const trimmed = text.trim()
+      if (trimmed === '') return { kind: 'clear' }
+      if (!/^\d+$/.test(trimmed)) return undefined
+      return { kind: 'set', value: Number(trimmed) }
+    },
+  }
+}
+
+/** 毫秒字段:至少 1000,避免把超时配成 0 变成「立刻失败」。 */
+export function millisecondsField(field: string, minimum: number): SettingsFieldSpec {
+  return {
+    field,
+    format: (value) => (value === undefined || value === null ? '' : String(value)),
+    parse: (text): SettingsFieldWrite | undefined => {
+      const trimmed = text.trim()
+      if (trimmed === '') return { kind: 'clear' }
+      if (!/^\d+$/.test(trimmed)) return undefined
+      const value = Number(trimmed)
+      if (value < minimum) return undefined
+      return { kind: 'set', value }
+    },
+  }
 }
