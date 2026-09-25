@@ -120,9 +120,24 @@ function isValidPattern(pattern: string): boolean {
 }
 
 /** 解析统计,便于启动日志里解释「为什么少了若干行」。 */
+/** 一行无法识别的内容(编辑器据此把问题指到具体行)。 */
+export interface ParseIssue {
+  /** 1 起的行号。 */
+  line: number
+  /** 该行原文(已 trim,过长时截断)。 */
+  text: string
+}
+
 export interface ParseOutcome {
   rules: ParsedRule[]
   skipped: number
+  /**
+   * 被跳过的行(带行号)。
+   *
+   * 解析刻意宽容(第三方清单里有各种元信息行),所以「跳过」不等于「错误」;
+   * 但设置页的规则编辑器要把它们显示出来 —— 打错一个域名却毫无提示是最糟的体验。
+   */
+  issues: ParseIssue[]
 }
 
 /**
@@ -140,7 +155,15 @@ export function parseRules(
 ): ParseOutcome {
   const rules: ParsedRule[] = []
   let skipped = 0
-  for (const rawLine of text.split(/\r?\n/)) {
+  const issues: ParseIssue[] = []
+  /** 记一行「跳过了什么」:文本截断到 80 字符,免得把整份清单回灌进响应。 */
+  const note = (lineNumber: number, raw: string): void => {
+    skipped++
+    const text = raw.trim()
+    issues.push({ line: lineNumber, text: text.length > 80 ? `${text.slice(0, 80)}…` : text })
+  }
+  for (const [index, rawLine] of text.split(/\r?\n/).entries()) {
+    const lineNumber = index + 1
     let line = rawLine.trim()
     if (line === '' || line.startsWith('#') || line.startsWith('//')) continue
     // YAML 列表项 / 引号
@@ -176,13 +199,13 @@ export function parseRules(
           const inner = type === 'PROXY' ? 'proxy' : 'direct'
           const rest = /^(proxy|direct)\s*:\s*(.+)$/i.exec(value)
           const pattern = normalizeHost(rest ? rest[2]! : value)
-          if (!isValidPattern(pattern)) { skipped++; continue }
+          if (!isValidPattern(pattern)) { note(lineNumber, rawLine); continue }
           rules.push({ pattern, route: inner, kind: 'exact', source: options.source })
           continue
         }
         if (type.includes('KEYWORD')) {
           const keyword = value.toLowerCase()
-          if (keyword === '') { skipped++; continue }
+          if (keyword === '') { note(lineNumber, rawLine); continue }
           rules.push({ pattern: keyword, route, kind: 'keyword', source: options.source })
           continue
         }
@@ -195,10 +218,10 @@ export function parseRules(
     line = line.replace(/^\|\|?/, '').replace(/\^$/, '').replace(/\/.*$/, '')
     line = line.replace(/^\*\./, '').replace(/^\+\./, '').replace(/^\./, '')
     const pattern = normalizeHost(line)
-    if (!isValidPattern(pattern)) { skipped++; continue }
+    if (!isValidPattern(pattern)) { note(lineNumber, rawLine); continue }
     rules.push({ pattern, route, kind, source: options.source })
   }
-  return { rules, skipped }
+  return { rules, skipped, issues }
 }
 
 /**

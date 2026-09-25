@@ -8,13 +8,19 @@
  * 组件只负责渲染。
  */
 import type { SettingsFieldSpec, SettingsFieldWrite } from '@deepseek-ai/dsh-client-ui-primitives'
+import { isLoopbackHost, splitHostPort } from '../loopback.ts'
 
-/** 宿主挂的只读状态路由(卡片读它显示运行态;同源,无 CORS)。 */
+/** 宿主挂的只读状态路由(分区读它显示运行态;同源,无 CORS)。 */
 export const STATUS_PATH = '/dsh-proxy-router/status'
 
-/** 状态接口返回的形状(只取卡片要显示的部分)。 */
+/** 宿主挂的本地规则文件读写路由(分区里的规则编辑区用它)。 */
+export const RULES_PATH = '/dsh-proxy-router/rules'
+
+/** 状态接口返回的形状(只取分区要显示的部分)。 */
 export interface HostStatus {
   settingsRegistered?: boolean
+  /** 总开关:假 = 插件完全不动作(不监听、不接管策略、不刷清单)。 */
+  enabled?: boolean
   listening?: { host: string; port: number } | null
   upstream?: { url: string; source: string } | null
   /** 配置了上游但被判定为指向插件自己(会被忽略)时由宿主置真。 */
@@ -25,6 +31,22 @@ export interface HostStatus {
   lists?: { name: string; count: number; fetchedAt: string | null; stale: boolean; lastError: string | null }[]
   stats?: { total: number; direct: number; proxied: number; failed: number; fallback: number } | null
   policy?: { verified: boolean; childRouting: 'router' | 'upstream' | 'none'; modulePath: string } | null
+}
+
+/** 本地规则文件接口返回的形状(GET 与 PUT 回执同一份口径)。 */
+export interface RulesSnapshot {
+  path: string
+  exists: boolean
+  content: string
+  /** 解析摘要:总条数与按动作拆开的条数,skipped = 无法识别的行数。 */
+  summary?: { total: number; proxy: number; direct: number; skipped: number }
+  /** 无法识别的行(带行号),编辑器直接显示出来。 */
+  issues?: { line: number; text: string }[]
+  /** 保存回执:是否已写盘、备份路径、当前是否已在运行中生效。 */
+  ok?: boolean
+  backupPath?: string | null
+  applied?: boolean
+  error?: string
 }
 
 /** 读一个设置值成草稿文本;缺省用空串表示「没有覆盖」。 */
@@ -59,6 +81,10 @@ export function upstreamField(): SettingsFieldSpec {
 /**
  * 监听地址字段:`host:port`,空草稿 = 清除覆盖(回到默认 127.0.0.1:17890)。
  * 端口 0 表示「让系统分配」(排查时有用),所以 0 是合法的。
+ *
+ * **只接受回环地址**:本插件内置的本地代理不鉴权(连调试接口都没有鉴权),
+ * 绑非回环 = 在局域网里开一个开放代理。这里先拦一道给出「格式不对」,
+ * 宿主侧 `parseListen` 还会再拦一道(防止有人直接改 profile 文件)。
  */
 export function listenField(): SettingsFieldSpec {
   return {
@@ -67,13 +93,11 @@ export function listenField(): SettingsFieldSpec {
     parse: (text): SettingsFieldWrite | undefined => {
       const trimmed = text.trim()
       if (trimmed === '') return { kind: 'clear' }
-      const at = trimmed.lastIndexOf(':')
-      if (at <= 0) return undefined
-      const host = trimmed.slice(0, at).trim()
-      const port = Number(trimmed.slice(at + 1))
-      if (host === '' || !/^\d{1,5}$/.test(trimmed.slice(at + 1))) return undefined
-      if (!Number.isInteger(port) || port < 0 || port > 65535) return undefined
-      return { kind: 'set', value: `${host}:${port}` }
+      const parsed = splitHostPort(trimmed)
+      if (parsed === null || !isLoopbackHost(parsed.host)) return undefined
+      // IPv6 用方括号形态回写,免得 `::1:17890` 这种歧义写法流进配置文件
+      const host = parsed.host.includes(':') ? `[${parsed.host}]` : parsed.host
+      return { kind: 'set', value: `${host}:${parsed.port}` }
     },
   }
 }

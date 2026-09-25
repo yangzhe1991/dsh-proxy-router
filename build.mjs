@@ -90,21 +90,23 @@ await writeFile(
     '}',
     '/** 插件入口。 */',
     'export declare function apply(ctx: HostContextLike, config?: unknown): void;',
-    '/** 宿主 Web 服务器上的只读状态路由路径(设置页卡片读它)。 */',
+    '/** 宿主 Web 服务器上的只读状态路由路径(设置页分区读它)。 */',
     'export declare const STATUS_ROUTE_PATH: "/dsh-proxy-router/status";',
+    '/** 宿主 Web 服务器上的本地规则文件读写路由(GET 读正文与诊断、PUT 写;写要求同源)。 */',
+    'export declare const RULES_ROUTE_PATH: "/dsh-proxy-router/rules";',
     '',
   ].join('\n'),
 )
 await writeFile(
   'lib/types/client/index.d.ts',
   [
-    '/** @yangzhe1991/dsh-proxy-router 插件,浏览器半:设置页里的配置卡片。 */',
-    '/** 需要的客户端服务:slots(槽位)、settingsScope(设置分节读写)。 */',
+    '/** @yangzhe1991/dsh-proxy-router 插件,浏览器半:设置页里的「分流代理」分区。 */',
+    '/** 需要的客户端服务:slots(槽位)、configForms(这一行的共享配置表单)。 */',
     'export declare const inject: string[];',
     '/** 客户端插件 body。 */',
     'export declare function apply(ctx: unknown): void;',
-    '/** 配置卡片组件(设置页注册用;也可单独渲染)。 */',
-    'export declare function ProxyRouterCard(props: { scope: unknown; initialOpen?: boolean }): unknown;',
+    '/** 设置分区组件(注册进 settings.section;也可单独渲染)。 */',
+    'export declare function ProxyRouterSection(props: unknown): unknown;',
     '',
   ].join('\n'),
 )

@@ -49,7 +49,7 @@ export interface RuleLoaderOptions {
 }
 
 /** 首次运行时写下的模板:语法就地说明,用户不用翻 README。 */
-const LOCAL_RULES_TEMPLATE = `# @yangzhe1991/dsh-proxy-router 本地规则
+export const LOCAL_RULES_TEMPLATE = `# @yangzhe1991/dsh-proxy-router 本地规则
 #
 # 这个文件改完立即生效(自动热加载),不需要重启 dsh。
 # 规则自上而下匹配,先命中者生效;本地规则优先级高于远程被墙清单,

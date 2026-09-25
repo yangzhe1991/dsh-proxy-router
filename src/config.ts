@@ -3,7 +3,7 @@
  *
  * dsh 0.1.7 起,插件配置的来源统一成「插件行的 Config schema」:
  *   - 组合配置(profile 的 `cordis.patch.yml` 里那行 config)= 部署默认值;
- *   - 用户在 Plugins 页里填的值写回同一处(profile 用户层),由宿主合并后交给 apply;
+ *   - 用户在设置页里填的值写回同一处(profile 用户层),由宿主合并后交给 apply;
  *   - 字段带 `.volatile()` 标记的可以**热生效**:宿主把新值直接写进运行中 fiber 的
  *     引用(ref),插件通过 `config.x.get()` 读到新值,并收到 `loader/volatile-update`;
  *     没有 volatile 的字段只在(重新)挂载时生效。
@@ -14,6 +14,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
+import { isLoopbackHost, splitHostPort } from './loopback.ts'
 import type { Route } from './rules.js'
 import type { Logger } from './fetcher.js'
 import type { UpstreamTarget } from './router.js'
@@ -30,6 +31,8 @@ export interface ResolvedUpstream extends UpstreamTarget {
  * 也是归一化之后插件内部使用的形状。
  */
 export interface SettingsValue {
+  /** 总开关:假 = 插件完全不动作(不监听、不接管策略),一切按原有环境走。 */
+  enabled: boolean
   /** 上游代理地址;空串表示沿用环境变量/未配置。 */
   upstream: string
   /** 未命中任何规则时的走向。 */
@@ -56,6 +59,7 @@ export interface CompositionExtras {
 
 /** 归一化之后的运行时配置。 */
 export interface ResolvedConfig extends CompositionExtras {
+  enabled: boolean
   upstream: ResolvedUpstream | null
   listen: { host: string; port: number }
   defaultRoute: Route
@@ -81,6 +85,7 @@ export const DEFAULT_REFRESH_HOURS = 24
 
 /** 设置页 schema 里出现、组合配置里也认的字段名(用于未知字段告警)。 */
 const SETTINGS_KEYS = [
+  'enabled',
   'upstream',
   'defaultRoute',
   'lists',
@@ -96,7 +101,7 @@ const EXTRAS_KEYS = ['stateDir', 'rulesFile'] as const
 /**
  * 插件行配置 schema(dsh 0.1.7 的插件配置契约:宿主读插件模块导出的 `Config`)。
  *
- * `.volatile()` 的含义:这个字段可以在 Plugins 页里改、并且**不重挂插件**就生效
+ * `.volatile()` 的含义:这个字段可以在设置页里改、并且**不重挂插件**就生效
  * (宿主把新值写进运行中 fiber 的引用,插件收到 `loader/volatile-update`)。
  * 只有 volatile 字段会出现在设置表单里 —— 因此运行期可调的旋钮全部标了 volatile。
  *
@@ -104,6 +109,11 @@ const EXTRAS_KEYS = ['stateDir', 'rulesFile'] as const
  * 不属于「随手改一下」的偏好项,留在 profile 的 cordis.patch.yml 里配置。
  */
 export const Config = z.object({
+  enabled: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('总开关:关(默认)= 插件完全不动作 —— 不监听本地端口、不接管宿主代理策略、不刷清单,一切按原有环境走;开 = 按规则分流'),
   upstream: z
     .string()
     .default('')
@@ -152,6 +162,7 @@ export interface VolatileRef<T> {
 
 /** 配置对象里本插件用到的字段(宿主已按 schema 校验并补默认值)。 */
 export interface PluginConfigLike {
+  readonly enabled?: VolatileRef<boolean> | boolean
   readonly upstream?: VolatileRef<string> | string
   readonly defaultRoute?: VolatileRef<Route> | Route
   readonly listen?: VolatileRef<string> | string
@@ -182,6 +193,8 @@ export function refValue<T>(node: VolatileRef<T> | T | undefined, fallback: T): 
 /** 当前配置的原始值快照(每次读都取最新值 —— volatile 热更新后的值就在里面)。 */
 export function readConfigRaw(config: PluginConfigLike): Record<string, unknown> {
   return {
+    // 总开关字段必须在列:漏一个字段的后果不是报错,而是它永远走默认值(这里 = 永远关着)。
+    enabled: refValue(config.enabled, false),
     upstream: refValue(config.upstream, ''),
     defaultRoute: refValue(config.defaultRoute, 'direct'),
     listen: refValue(config.listen, DEFAULT_LISTEN),
@@ -226,21 +239,28 @@ function numberField(value: unknown, fallback: number, name: string, log: Logger
   return fallback
 }
 
-/** 解析 `127.0.0.1:17890` / `:17890` 形态的监听地址。 */
+/**
+ * 解析 `127.0.0.1:17890` / `:17890` 形态的监听地址。
+ *
+ * **只接受回环地址**。本插件内置的是一个无认证的本地正向代理(调试接口也不鉴权),
+ * 绑到 `0.0.0.0` 或内网地址等于给局域网开一个开放代理 —— 所以非回环地址在这里
+ * 直接回退到回环并告警,而不是「照你说的绑」。端口保留用户填的值(合法时)。
+ */
 export function parseListen(value: string, log: Logger): { host: string; port: number } {
   const trimmed = value.trim()
-  const at = trimmed.lastIndexOf(':')
-  if (at === -1) {
-    log.warn(`listen 配置 "${value}" 缺少端口,使用默认 ${DEFAULT_LISTEN}`)
+  const parsed = splitHostPort(trimmed === '' ? DEFAULT_LISTEN : trimmed.startsWith(':') ? `127.0.0.1${trimmed}` : trimmed)
+  if (parsed === null) {
+    log.warn(`listen 配置 "${value}" 不是合法的 host:port,使用默认 ${DEFAULT_LISTEN}`)
     return { host: '127.0.0.1', port: 17890 }
   }
-  const host = trimmed.slice(0, at).trim() === '' ? '127.0.0.1' : trimmed.slice(0, at).trim()
-  const port = Number(trimmed.slice(at + 1))
-  if (!Number.isInteger(port) || port < 0 || port > 65535) {
-    log.warn(`listen 配置 "${value}" 端口非法,使用默认 ${DEFAULT_LISTEN}`)
-    return { host: '127.0.0.1', port: 17890 }
+  if (!isLoopbackHost(parsed.host)) {
+    log.warn(
+      `listen 配置 "${value}" 不是回环地址,已改回 127.0.0.1:${parsed.port} —— ` +
+        '本插件的本地代理解析不鉴权,绑非回环等于对局域网开放代理',
+    )
+    return { host: '127.0.0.1', port: parsed.port }
   }
-  return { host, port }
+  return { host: parsed.host, port: parsed.port }
 }
 
 /**
@@ -307,6 +327,9 @@ export function normalizeSettingsValue(raw: unknown, log: Logger): SettingsValue
     log.warn('配置项 lists 不是字符串数组,已使用默认被墙清单')
   }
   return {
+    // 总开关默认「关」:新装/新用户 = 全直连,想用分流得自己打开 —— 避免一个装了就改全局
+    // 代理行为的插件在用户没同意的情况下生效。
+    enabled: booleanField(record.enabled, false, 'enabled', log),
     upstream: stringField(record.upstream, '', 'upstream', log),
     defaultRoute: route,
     lists,
@@ -398,6 +421,7 @@ export function resolveRuntimeConfig(
 
   return {
     ...extras,
+    enabled: value.enabled,
     upstream,
     listen: parseListen(value.listen, log),
     defaultRoute: value.defaultRoute,

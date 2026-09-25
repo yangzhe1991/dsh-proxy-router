@@ -15,6 +15,7 @@
  */
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { connect as netConnect, type Socket } from 'node:net'
+import { isLoopbackHost } from './loopback.ts'
 import type { Route } from './rules.js'
 import type { Logger } from './fetcher.js'
 
@@ -73,8 +74,9 @@ export const CONTROL_PREFIX = '/__proxy-router/'
  * 回环名称判定:127.0.0.1 / localhost / ::1 视为同一台机器。
  * 用于两处防自环:目标是不是本代理自己、上游是不是也指向本代理自己。
  */
+/** 是否是回环地址(判定「这条请求的目标是不是我自己」)。口径与配置层的 listen 校验共用一处。 */
 export function isLoopbackName(host: string): boolean {
-  return host === 'localhost' || host === '::1' || host === '[::1]' || /^127\./.test(host)
+  return isLoopbackHost(host)
 }
 
 /** 目标主机端口。 */

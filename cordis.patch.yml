@@ -3,7 +3,7 @@
 # 用户可在自己 profile 的 cordis.patch.yml 里按 id 覆盖配置或禁用此行。
 #
 # 这里的 config 是「部署默认值」(base 层):日常改配置请走
-# Web 侧边栏 Plugins → 本插件包 → 行 proxy-router → Configure,
+# Web 侧边栏 设置 → 分流代理(插件把分区注册进设置页的 settings.section 槽位),
 # 那一层的值写回本 profile 的用户层(cordis.patch.yml),标了 volatile 的字段热生效。
 # 部署默认值适合写「这台机器就长这样」的项:
 #

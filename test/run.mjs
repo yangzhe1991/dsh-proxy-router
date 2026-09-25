@@ -94,11 +94,28 @@ const ctx = {
   },
 }
 
-/** 宿主 schema 与客户端卡片共用的字段集合,任一侧漏字段都要在这里炸出来。 */
-const FIELDS_KEYS = ['upstream', 'defaultRoute', 'lists', 'refreshHours', 'listen', 'connectTimeoutMs', 'fallbackDirect', 'debug']
+/**
+ * 设置页可改的字段(= schema 里标了 volatile 的那些)。
+ *
+ * 这份清单是**故意的重复**:schema 新增一个 volatile 字段、却忘了在宿主半的
+ * `readConfigRaw` 里读它,后果不是报错而是「它永远走默认值」—— 加总开关时就踩过
+ * (`enabled` 漏读 = 开关永远是关的)。两条断言一起把这种静默漂移钉住:
+ * ① 第 5 段比对 schema 的 volatile 集合与本清单;② 第 9 段拿 enabled 跑真实启停。
+ */
+const VOLATILE_KEYS = [
+  'enabled',
+  'upstream',
+  'defaultRoute',
+  'listen',
+  'refreshHours',
+  'connectTimeoutMs',
+  'fallbackDirect',
+  'debug',
+]
 
 const { apply } = await import(pathToFileURL(join(ROOT, 'lib/index.js')).href)
 apply(ctx, {
+  enabled: true,
   upstream: UPSTREAM,
   listen: `127.0.0.1:${PORT}`,
   lists: [],
@@ -131,11 +148,11 @@ const run = promisify(execFile)
  * 而本地分流代理就跑在同一个进程里 —— 同步调用等于自己把服务器锁死,
  * 现象是 curl 一直收不到字节直到超时。
  */
-async function curlThroughProxy(url, extraArgs = []) {
+async function curlThroughProxy(url, extraArgs = [], proxy = LOCAL) {
   try {
     const { stdout } = await run(
       'curl',
-      ['-sS', '-x', LOCAL, '--max-time', '25', '-o', '/dev/null', '-w', '%{http_code}', ...extraArgs, url],
+      ['-sS', '-x', proxy, '--max-time', '25', '-o', '/dev/null', '-w', '%{http_code}', ...extraArgs, url],
       { env: { ...process.env, no_proxy: '', NO_PROXY: '' }, encoding: 'utf8' },
     )
     return { code: stdout.trim(), err: '' }
@@ -228,6 +245,7 @@ console.log('\n[3] 上游不可用时的回退')
   writeFileSync(rulesFile2, 'proxy: www.baidu.com\n', 'utf8')
   const ctx2 = { get: () => undefined, effect: (fn) => disposers.push(fn()) }
   apply(ctx2, {
+    enabled: true,
     upstream: 'http://127.0.0.1:9', // 必然连不上的上游
     listen: `127.0.0.1:${PORT}`,
     lists: [],
@@ -256,6 +274,7 @@ console.log('\n[4] 默认远程清单与优先级')
   writeFileSync(rulesFile3, 'direct: www.google.com\n', 'utf8')
   const ctx3 = { get: () => undefined, effect: (fn) => disposers.push(fn()) }
   apply(ctx3, {
+    enabled: true,
     upstream: UPSTREAM,
     listen: `127.0.0.1:${PORT}`,
     stateDir: STATE3,
@@ -295,21 +314,33 @@ console.log('\n[5] 行配置 schema 与 volatile 热应用')
   writeFileSync(rulesFile5, 'proxy: www.google.com\n', 'utf8')
 
   const { Config } = await import(pathToFileURL(join(ROOT, 'lib/index.js')).href)
-  check('导出 Config schema(宿主读它校验配置、生成 Plugins 页表单)', typeof Config?.['~standard'] === 'object')
+  check('导出 Config schema(宿主读它校验配置、生成设置页表单)', typeof Config?.['~standard'] === 'object')
   const schemaJson = JSON.stringify(typeof Config.toJSON === 'function' ? Config.toJSON() : {})
   check(
     'schema 里运行期旋钮都带 volatile(只有 volatile 字段能出现在表单里并热生效)',
-    ['upstream', 'defaultRoute', 'listen', 'refreshHours', 'connectTimeoutMs', 'fallbackDirect', 'debug'].every(
-      (key) => schemaJson.includes(`"${key}"`),
-    ),
+    VOLATILE_KEYS.every((key) => schemaJson.includes(`"${key}"`)),
+  )
+  // 反向钉住:宿主半 readConfigRaw 逐字段列举,漏一个就永远走默认值(不报错)。
+  // volatile 字段在解析结果里是引用({get}),非 volatile 是普通值 —— 据此把集合取出来比对。
+  const volatileFromSchema = Object.entries(Config({}))
+    .filter(([, value]) => value !== null && typeof value === 'object' && typeof value.get === 'function')
+    .map(([key]) => key)
+    .sort()
+  check(
+    'schema 的 volatile 集合 = 可改字段清单(新增字段必须同时改 readConfigRaw 与本清单)',
+    JSON.stringify(volatileFromSchema) === JSON.stringify([...VOLATILE_KEYS].sort()),
+    JSON.stringify(volatileFromSchema),
   )
   const defaults = Config({})
   // volatile 字段在解析结果里是引用(宿主热更新就是改这个引用),测试里按引用读一次。
   const plain = (node) => (node !== null && typeof node === 'object' && typeof node.get === 'function' ? node.get() : node)
   check(
-    'schema 默认值来自插件常量',
-    plain(defaults.defaultRoute) === 'direct' && plain(defaults.listen) === '127.0.0.1:17890' && plain(defaults.fallbackDirect) === true,
-    JSON.stringify({ route: plain(defaults.defaultRoute), listen: plain(defaults.listen) }),
+    'schema 默认值来自插件常量(总开关默认关 = 新装全直连)',
+    plain(defaults.enabled) === false &&
+      plain(defaults.defaultRoute) === 'direct' &&
+      plain(defaults.listen) === '127.0.0.1:17890' &&
+      plain(defaults.fallbackDirect) === true,
+    JSON.stringify({ enabled: plain(defaults.enabled), route: plain(defaults.defaultRoute), listen: plain(defaults.listen) }),
   )
   check('schema 校验拒绝 socks 上游之外的类型错误(非字符串)', (() => {
     try {
@@ -322,6 +353,7 @@ console.log('\n[5] 行配置 schema 与 volatile 热应用')
 
   // 模拟宿主:volatile 字段以引用形态交给插件,热更新时改写引用并派发 loader/volatile-update
   const state = {
+    enabled: true,
     upstream: UPSTREAM,
     listen: `127.0.0.1:${PORT}`,
     defaultRoute: 'direct',
@@ -332,6 +364,7 @@ console.log('\n[5] 行配置 schema 与 volatile 热应用')
   }
   const ref = (key) => ({ get: () => state[key] })
   const configLike = {
+    enabled: ref('enabled'),
     upstream: ref('upstream'),
     listen: ref('listen'),
     defaultRoute: ref('defaultRoute'),
@@ -404,16 +437,22 @@ console.log('\n[5] 行配置 schema 与 volatile 热应用')
   rmSync(STATE5, { recursive: true, force: true })
 }
 
-// ──────────── 6. 浏览器半 bundle(Plugins 页配置卡片) ────────────
+// ──────────── 6. 浏览器半 bundle(设置页「分流代理」分区) ────────────
 console.log('\n[6] 浏览器半')
 {
   // 平台模块表 stub:bundle 的 factory 只 require 这三样;
-  // 卡片本身不渲染(渲染测试交给真浏览器),这里只验证装配与注册契约。
+  // 分区本身不渲染(渲染测试交给真浏览器),这里只验证装配与注册契约。
+  // `actions()` 必须与官方同形(edit/resetField/save/discard)——空对象会让
+  // 「inject 交出的面」那条断言假绿:插件只是把 form.actions() 原样摊出去。
   const table = {
     react: { useCallback: (fn) => fn, useEffect: () => {}, useState: (value) => [value, () => {}] },
     'react/jsx-runtime': { jsx: () => null, jsxs: () => null, Fragment: null },
     '@deepseek-ai/dsh-client-ui-primitives': {
-      SettingsFormModel: class { bind() { return { getSnapshot: () => ({}), subscribe: () => () => {} } } dispose() {} actions() { return {} } },
+      SettingsFormModel: class {
+        bind() { return { getSnapshot: () => ({}), subscribe: () => () => {} } }
+        dispose() {}
+        actions() { return { edit: () => {}, resetField: () => {}, save: () => {}, discard: () => {} } }
+      },
       SettingsForm: () => null,
       SettingsValueField: () => null,
     },
@@ -471,13 +510,24 @@ console.log('\n[6] 浏览器半')
     effect: (fn) => fn(),
   }
   plugin.apply(ctxClient)
-  check('卡片只在该行被 served 时注册', JSON.stringify(served) === JSON.stringify(['proxy-router']), JSON.stringify(served))
+  check('分区只在该行被 served 时注册', JSON.stringify(served) === JSON.stringify(['proxy-router']), JSON.stringify(served))
   check(
-    '注册到 plugins.row.config,key = 包名#行 id',
-    registrations.length === 1 && registrations[0].options.key === '@yangzhe1991/dsh-proxy-router#proxy-router' && registrations[0].options.name === 'plugins.row.config',
+    '注册到 settings.section(id=行 id、order=22 排在官方项之后、label=分流代理)',
+    registrations.length === 1 &&
+      registrations[0].options.name === 'settings.section' &&
+      registrations[0].options.id === 'proxy-router' &&
+      registrations[0].options.order === 22 &&
+      registrations[0].options.label === '分流代理',
     JSON.stringify(registrations[0]?.options),
   )
-  check('卡片样式已注入且带 data-plugin-css 标记', styleTags.length === 1 && String(styleTags[0].dataset.pluginCss ?? '').includes('dsh-proxy-router'))
+  // 组件与注册之间靠这个 hook 名对接:hooks.proxyRouterSection → props.useProxyRouterSection。
+  const face = registrations[0]?.options.inject?.()
+  check(
+    'inject 交出的面:proxyRouterSection store + 表单动作',
+    face?.hooks?.proxyRouterSection !== undefined && typeof face.save === 'function' && typeof face.edit === 'function',
+    JSON.stringify(Object.keys(face ?? {})),
+  )
+  check('分区样式已注入且带 data-plugin-css 标记', styleTags.length === 1 && String(styleTags[0].dataset.pluginCss ?? '').includes('dsh-proxy-router'))
 
   // 白屏防线:服务缺失/形状不符时必须安静退出,绝不抛(浏览器半抛错会掀掉整棵组合树)
   const registrations2 = []
@@ -497,8 +547,8 @@ console.log('\n[6] 浏览器半')
   delete globalThis.document
 }
 
-// ──────────── 7. 客户端字段规则(纯函数) ────────────
-console.log('\n[7] 客户端字段规则')
+// ──────────── 7. 字段规则(客户端)与监听地址加固(两侧) ────────────
+console.log('\n[7] 字段规则与监听地址加固')
 {
   const { upstreamField, listenField, routeField, booleanField, nonNegativeNumberField, millisecondsField } = await import('../src/client/fields.ts')
   const parse = (spec, text) => spec.parse(text)
@@ -506,10 +556,31 @@ console.log('\n[7] 客户端字段规则')
   check('上游留空 = 清除覆盖(回落到环境变量)', parse(upstreamField(), '  ')?.kind === 'clear')
   check('监听地址校验端口', parse(listenField(), '127.0.0.1:99999') === undefined && parse(listenField(), '127.0.0.1:17890')?.value === '127.0.0.1:17890')
   check('监听地址留空 = 回到默认', parse(listenField(), '')?.kind === 'clear')
+  check(
+    '监听地址只收回环(0.0.0.0 / 内网 / 公网 / 非回环 IPv6 都判非法)',
+    ['0.0.0.0:17890', '192.168.1.5:17890', '8.8.8.8:17890', '[2001:db8::1]:17890'].every(
+      (text) => parse(listenField(), text) === undefined,
+    ) &&
+      parse(listenField(), 'localhost:0')?.value === 'localhost:0' &&
+      parse(listenField(), '[::1]:1234')?.value === '[::1]:1234',
+  )
   check('未命中走向只认 direct/proxy', parse(routeField(), 'both') === undefined && parse(routeField(), 'proxy')?.value === 'proxy')
   check('布尔字段接受 true/false/1/0/on/off', ['true', '1', 'on', 'yes'].every((t) => parse(booleanField('debug'), t)?.value === true) && ['false', '0', 'off', 'no'].every((t) => parse(booleanField('debug'), t)?.value === false))
   check('非负整数字段拒绝负数与小数', parse(nonNegativeNumberField('refreshHours'), '-1') === undefined && parse(nonNegativeNumberField('refreshHours'), '2.5') === undefined && parse(nonNegativeNumberField('refreshHours'), '24')?.value === 24)
   check('超时字段有下限', parse(millisecondsField('connectTimeoutMs', 1000), '500') === undefined && parse(millisecondsField('connectTimeoutMs', 1000), '15000')?.value === 15000)
+
+  // 宿主侧再拦一道:有人直接改 profile 文件(绕过上面的表单校验)时不能真的绑出去
+  const { parseListen } = await import('../src/config.ts')
+  const warns = []
+  const fakeLog = { info: () => {}, debug: () => {}, warn: (message) => warns.push(String(message)) }
+  check(
+    '宿主侧 parseListen 把非回环地址改回回环并告警',
+    parseListen('0.0.0.0:18080', fakeLog).host === '127.0.0.1' &&
+      parseListen('0.0.0.0:18080', fakeLog).port === 18080 &&
+      warns.some((line) => line.includes('不是回环地址')),
+    JSON.stringify({ warn: warns.at(-1) }),
+  )
+  check('宿主侧 parseListen 保留合法回环地址', parseListen('127.0.0.1:18081', fakeLog).port === 18081 && parseListen(':18082', fakeLog).port === 18082)
 }
 
 // ──────────── 8. 防自环(线上曾刷出 1.1 亿次请求) ────────────
@@ -587,6 +658,7 @@ console.log('\n[8] 防自环')
   writeFileSync(rulesFile8, 'proxy: www.baidu.com\n', 'utf8')
   const ctx8 = { get: () => undefined, effect: (fn) => disposers.push(fn()) }
   apply(ctx8, {
+    enabled: true,
     upstream: `http://127.0.0.1:${PORT}`,
     listen: `127.0.0.1:${PORT}`,
     lists: [],
@@ -610,6 +682,241 @@ console.log('\n[8] 防自环')
   check('规则命中但没有上游时退化为直连且不循环', baidu.code === '200' && statsAfter - statsBefore <= 3, `${baidu.code || baidu.err};增量 ${statsAfter - statsBefore}`)
   for (const dispose of disposers.splice(0)) await dispose()
   rmSync(STATE8, { recursive: true, force: true })
+}
+
+// ──────────── 9. 总开关:默认关 = 插件完全不动作 ────────────
+console.log('\n[9] 总开关(默认关 / 热启停)')
+{
+  const STATE9 = join(HERE, '.test-state-9')
+  rmSync(STATE9, { recursive: true, force: true })
+  mkdirSync(STATE9, { recursive: true })
+  const rulesFile9 = join(STATE9, 'rules.txt')
+  writeFileSync(rulesFile9, 'proxy: www.google.com\n', 'utf8')
+  const PORT9 = Number(process.env.TEST_PORT_SWITCH ?? 17931)
+  const LOCAL9 = `http://127.0.0.1:${PORT9}`
+
+  const { apply: applySwitch } = await import(pathToFileURL(join(ROOT, 'lib/index.js')).href)
+
+  // 上一段的收摊是异步的(disposer 只是 `void shutdown()`,不 await):不等它落地就取基线,
+  // 会把别人回填环境变量的动作算到这一段头上 —— 这里先等一拍再取基线。
+  await new Promise((r) => setTimeout(r, 800))
+  // 环境变量基线:关掉开关后必须还原成这一份(策略模块自己负责还原)。
+  const envBefore = {
+    http_proxy: process.env.http_proxy,
+    https_proxy: process.env.https_proxy,
+    all_proxy: process.env.all_proxy,
+    no_proxy: process.env.no_proxy,
+  }
+  const envMatches = () =>
+    process.env.http_proxy === envBefore.http_proxy &&
+    process.env.https_proxy === envBefore.https_proxy &&
+    process.env.no_proxy === envBefore.no_proxy
+  /** 等环境变量回到基线:策略还原发生在「关监听」之后,不能抢跑断言。 */
+  const waitEnv = async (timeoutMs = 5000) => {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (envMatches()) return true
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    return false
+  }
+
+  /** 总开关的「宿主引用」:默认关(与 schema 默认一致)。 */
+  let enabled = false
+  const events9 = []
+  const routes9 = []
+  const disposers9 = []
+  const fakeWebServer9 = { register(route) { routes9.push(route); return () => {} } }
+  const ctx9 = {
+    get: (name) => (name === 'webServer' ? fakeWebServer9 : undefined),
+    on: (name, listener) => { events9.push([name, listener]) },
+    effect: (fn) => { disposers9.push(fn()) },
+    inject: (deps, cb) => cb({ get: (name) => (name === 'webServer' ? fakeWebServer9 : undefined) }),
+  }
+  applySwitch(ctx9, {
+    // 不传 enabled = 让插件走 schema 默认(false);其余字段给足,证明「关」是开关说了算
+    enabled: { get: () => enabled },
+    upstream: { get: () => UPSTREAM },
+    listen: { get: () => `127.0.0.1:${PORT9}` },
+    refreshHours: { get: () => 0 },
+    connectTimeoutMs: { get: () => 15000 },
+    fallbackDirect: { get: () => true },
+    debug: { get: () => false },
+    lists: [],
+    stateDir: STATE9,
+    rulesFile: rulesFile9,
+  })
+
+  /** 直连端口:连得上 = 有人在监听(关着的时候不该有人监听)。 */
+  const probe = async () => {
+    try {
+      const res = await fetch(`${LOCAL9}/__proxy-router/status`, { signal: AbortSignal.timeout(1000) })
+      return res.ok ? await res.json() : null
+    } catch {
+      return null
+    }
+  }
+  /** 从 Web 状态路由读快照(关着的时候没有本地端口,面板走的就是这条)。 */
+  const webStatus = async () => {
+    const handler = routes9.find((route) => route.path === '/dsh-proxy-router/status')?.handler
+    if (handler === undefined) return null
+    let body = ''
+    await handler({ method: 'GET' }, { writeHead() {}, end(text) { body = text ?? '' } })
+    return JSON.parse(body)
+  }
+  /** 派发一次宿主热更新(宿主改完引用后发的就是它)。 */
+  const fire = () => {
+    for (const [name, listener] of events9) if (name === 'loader/volatile-update') listener()
+  }
+
+  await new Promise((r) => setTimeout(r, 400))
+  check('默认关:根本没人监听本地端口', (await probe()) === null)
+  const off = await webStatus()
+  check(
+    '默认关:状态路由仍可用,并如实报告 enabled=false / 未监听 / 未接管策略',
+    off?.enabled === false && off?.listening === null && off?.policy === null && off?.stats === null,
+    JSON.stringify({ enabled: off?.enabled, listening: off?.listening, policy: off?.policy }),
+  )
+  check(
+    '默认关:一个代理变量都不碰',
+    envMatches(),
+    `http_proxy=${String(process.env.http_proxy)} / https_proxy=${String(process.env.https_proxy)}`,
+  )
+
+  // 打开开关:宿主改引用 + 派发事件
+  enabled = true
+  fire()
+  let up = null
+  for (let i = 0; i < 40 && up === null; i++) {
+    await new Promise((r) => setTimeout(r, 150))
+    up = await probe()
+  }
+  check(
+    '打开开关后立即开始监听并接管策略(不用重启宿主)',
+    up !== null && up.enabled === true && up.policy?.verified === true,
+    JSON.stringify({ enabled: up?.enabled, childRouting: up?.policy?.childRouting, listening: up?.listening }),
+  )
+  const routed = await curlThroughProxy('https://www.google.com/', [], LOCAL9)
+  check('打开后分流真的生效(被墙域名经上游 200)', routed.code === '200', routed.code || routed.err)
+
+  // 再关掉:必须收干净 —— 端口关掉、策略还原、状态如实
+  enabled = false
+  fire()
+  let closed = false
+  for (let i = 0; i < 40 && !closed; i++) {
+    await new Promise((r) => setTimeout(r, 150))
+    closed = (await probe()) === null
+  }
+  check('关掉开关后停止监听', closed)
+  const offAgain = await webStatus()
+  check(
+    '关掉后状态回到 enabled=false(策略与统计清空,不再误导)',
+    offAgain?.enabled === false && offAgain?.listening === null && offAgain?.policy === null,
+    JSON.stringify({ enabled: offAgain?.enabled, listening: offAgain?.listening, policy: offAgain?.policy }),
+  )
+  check(
+    '关掉开关把代理变量还原了',
+    await waitEnv(),
+    `http_proxy=${String(process.env.http_proxy)} / https_proxy=${String(process.env.https_proxy)}`,
+  )
+
+  for (const dispose of disposers9.splice(0)) await dispose()
+  rmSync(STATE9, { recursive: true, force: true })
+}
+
+// ──────────── 10. 本地规则路由(GET/PUT /dsh-proxy-router/rules) ────────────
+console.log('\n[10] 设置页的规则编辑区(宿主路由)')
+{
+  const http = await import('node:http')
+  const STATE10 = join(HERE, '.test-state-10')
+  rmSync(STATE10, { recursive: true, force: true })
+  mkdirSync(STATE10, { recursive: true })
+  const rulesFile10 = join(STATE10, 'rules.txt')
+  writeFileSync(rulesFile10, '# 初始\nproxy: www.google.com\n', 'utf8')
+  const PROXY_PORT = Number(process.env.TEST_PORT_RULES ?? 17941)
+  const ROUTE_PORT = PROXY_PORT + 1
+
+  const { apply: applyRules } = await import(pathToFileURL(join(ROOT, 'lib/index.js')).href)
+  const routes10 = []
+  const disposers10 = []
+  const fakeWebServer10 = { register(route) { routes10.push(route); return () => {} } }
+  applyRules(
+    {
+      get: (name) => (name === 'webServer' ? fakeWebServer10 : undefined),
+      on: () => {},
+      effect: (fn) => { disposers10.push(fn()) },
+      inject: (deps, cb) => cb({ get: (name) => (name === 'webServer' ? fakeWebServer10 : undefined) }),
+    },
+    {
+      enabled: true,
+      upstream: UPSTREAM,
+      listen: `127.0.0.1:${PROXY_PORT}`,
+      lists: [],
+      refreshHours: 0,
+      stateDir: STATE10,
+      rulesFile: rulesFile10,
+    },
+  )
+
+  // 把插件注册的路由挂到一个真实的 node:http 服务器上 —— 这样 request body、头部与
+  // 流式读取都走真实的 IncomingMessage,而不是自己捏的假对象。
+  const server = http.createServer((req, res) => {
+    const path = new URL(req.url ?? '/', 'http://x').pathname
+    const route = routes10.find((candidate) => candidate.path === path)
+    if (route === undefined) {
+      res.writeHead(404)
+      res.end('not found')
+      return
+    }
+    void route.handler(req, res)
+  })
+  await new Promise((resolve) => server.listen(ROUTE_PORT, '127.0.0.1', resolve))
+  const base = `http://127.0.0.1:${ROUTE_PORT}`
+  const origin = { origin: base }
+  const put = (content, headers) =>
+    fetch(`${base}/dsh-proxy-router/rules`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify({ content }),
+    })
+
+  const got = await (await fetch(`${base}/dsh-proxy-router/rules`)).json()
+  check(
+    'GET 返回路径/正文/解析摘要',
+    got.path === rulesFile10 && got.exists === true && got.content.includes('proxy: www.google.com') && got.summary?.total === 1,
+    JSON.stringify({ path: got.path, summary: got.summary }),
+  )
+  check('PUT 缺 Origin/Referer → 403(宿主路由不过会话认证,写入口自己挡)', (await put('proxy: a.com', {})).status === 403)
+  check('PUT 跨站 Origin → 403', (await put('proxy: a.com', { origin: 'http://evil.example' })).status === 403)
+  check('POST → 405', (await fetch(`${base}/dsh-proxy-router/rules`, { method: 'POST', ...{ headers: origin } })).status === 405)
+
+  const badJson = await fetch(`${base}/dsh-proxy-router/rules`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', ...origin },
+    body: '{ 不是 JSON',
+  })
+  check('PUT 非法 JSON → 400', badJson.status === 400)
+
+  const tooBig = await put('x'.repeat(300 * 1024), origin)
+  check('PUT 超过体积上限 → 413', tooBig.status === 413)
+
+  // 正常保存:带一行无法识别的内容,检查「写盘 + 备份 + 逐行诊断 + 立刻生效」
+  const next = '# 新规则\ndirect: www.google.com\n这行肯定不是域名\nproxy: 1.2.3.4\n'
+  const saved = await (await put(next, origin)).json()
+  check(
+    'PUT 保存成功并回报诊断(1 行未识别,行号指向它)',
+    saved.ok === true && saved.summary?.direct === 1 && saved.summary?.skipped === 1 && saved.issues?.[0]?.line === 3,
+    JSON.stringify({ summary: saved.summary, issues: saved.issues }),
+  )
+  check('写盘内容与提交一致', readFileSync(rulesFile10, 'utf8') === next)
+  check('旧内容已备份到 <rulesFile>.bak', readFileSync(`${rulesFile10}.bak`, 'utf8').includes('proxy: www.google.com'))
+  check('没有留下临时文件', !existsSync(`${rulesFile10}.tmp-${process.pid}`))
+  const why = await (await fetch(`http://127.0.0.1:${PROXY_PORT}/__proxy-router/why?host=www.google.com`)).json()
+  check('保存后立刻生效(google 从 proxy 改判 direct)', why.route === 'direct' && why.reason.includes('local'), JSON.stringify(why))
+
+  for (const dispose of disposers10.splice(0)) await dispose()
+  await new Promise((resolve) => server.close(resolve))
+  rmSync(STATE10, { recursive: true, force: true })
 }
 
 rmSync(STATE_DIR, { recursive: true, force: true })

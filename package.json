@@ -1,7 +1,7 @@
 {
   "name": "@yangzhe1991/dsh-proxy-router",
-  "version": "0.2.0",
-  "description": "DSH 插件:本地分流代理 + Plugins 页配置卡片 —— 只有规则命中的被墙域名走上游代理,其余(国内/内网/未知)直连;上游地址、监听地址、超时等参数在 Plugins 页里改,volatile 热生效、免重启,卡片上带运行状态面板 | DSH plugin: local routing proxy with a configuration card on the Plugins page — only rule-matched (blocked) hosts use the upstream proxy, everything else goes direct; upstream, listen address, timeouts and more are edited there and applied live",
+  "version": "0.3.0",
+  "description": "DSH 插件:本地分流代理 + 设置页「分流代理」分区(带总开关,默认关 = 插件完全不动作、全直连;可直接编辑本地分流规则并逐行报错)—— 打开后只有规则命中的被墙域名走上游代理,其余(国内/内网/未知)直连;上游地址、监听地址、超时等参数就在设置页里改,volatile 热生效、免重启,分区上带运行状态面板 | DSH plugin: local routing proxy with a 分流代理 (Proxy Router) section in the Settings page — a master switch (off by default = completely inert, everything direct) plus an editor for the local routing rules with per-line diagnostics; once on, only rule-matched (blocked) hosts use the upstream proxy and everything else goes direct; upstream, listen address, timeouts and more are edited right there and applied live",
   "publishConfig": {
     "access": "public"
   },
