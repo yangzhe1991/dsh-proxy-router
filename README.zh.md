@@ -179,10 +179,11 @@ curl -x http://127.0.0.1:17890 -sI https://www.baidu.com    # 直连
 
 ## 兼容性
 
-- 自 **0.3.0** 起在 **dsh 0.1.7-rc.2** 上验证通过。
+- 自 **0.3.0** 起在 **dsh 0.1.7-rc.2** 上验证通过,自 **0.3.1** 起在 **dsh 0.2.0-rc.1** 上验证通过。
+- **0.3.1 为什么存在** —— dsh 0.2.0-rc.1 会把每个声明的 `@deepseek-ai/dsh-*` peer 范围与**运行时版本**比对,不匹配就跳过整个插件(`^0.1.7-rc.2` 不含 `0.2.0-rc.1`)。本版**没有代码改动**,只是把这些范围放宽为 `^0.1.7-rc.2 || ^0.2.0-rc.1`。在 0.2.0-rc.1 上,已装好的 **0.3.0** 也可以不升级直接放行:授予精确版本豁免即可(`dsh plugin --profile <profile> allow-version @yangzhe1991/dsh-proxy-router@0.3.0 --dsh-version 0.2.0-rc.1 --accept-risk`)。
 - **dsh < 0.1.7 不再支持**:0.1.7 把插件配置从 `settings.yaml` + `ctx.settings.installSection` + 客户端的 `settingsScope`/`settings.plugin.item` 换成了「插件行 `Config` schema + volatile 热更新」,本插件已按新契约实现。
 - 宿主半只依赖 `@deepseek-ai/dsh-http-proxy`、`@deepseek-ai/schemastery`、`undici` 的公开导出与 cordis 的 `ctx.get` / `ctx.effect` / `ctx.inject`;
-  浏览器半只 require `react`,不依赖任何 UI 包。
+  浏览器半只 require 平台模块表里的成员(`react`、`react/jsx-runtime`、`@deepseek-ai/dsh-client-ui-primitives`),不声明任何非基线模块请求。
 - 配置界面用的是官方设置体系(`Config` schema + 设置页 `settings.section` 槽位 + `ctx.configForms` 共享表单);
   宿主没在跑这一行时分区根本不出现(`configForms.whileServed` 门控),设置提供方缺失时安静退出,其余功能不受影响。
 

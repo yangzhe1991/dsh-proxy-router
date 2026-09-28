@@ -176,9 +176,10 @@ The startup log prints the upstream and its source, the bind address, rule count
 
 ## Compatibility
 
-- Verified against **dsh 0.1.7-rc.2** since **0.3.0**.
+- Verified against **dsh 0.1.7-rc.2** since **0.3.0**, and against **dsh 0.2.0-rc.1** since **0.3.1**.
+- **Why 0.3.1 exists** — dsh 0.2.0-rc.1 checks every declared `@deepseek-ai/dsh-*` peer range against the *runtime version* and skips any plugin whose ranges do not match (`^0.1.7-rc.2` excludes `0.2.0-rc.1`). No plugin code changed: **0.3.1** only widens those ranges to `^0.1.7-rc.2 || ^0.2.0-rc.1`. On 0.2.0-rc.1 an already-installed **0.3.0** can also be admitted without upgrading, by granting the exact-version exemption (`dsh plugin --profile <profile> allow-version @yangzhe1991/dsh-proxy-router@0.3.0 --dsh-version 0.2.0-rc.1 --accept-risk`).
 - **dsh < 0.1.7 is not supported**: 0.1.7 replaced plugin configuration (`settings.yaml` + `ctx.settings.installSection` + the client's `settingsScope` / `settings.plugin.item`) with a row-level `Config` schema and volatile live updates; this plugin implements the new contract.
-- The host half depends only on the public exports of `@deepseek-ai/dsh-http-proxy`, `@deepseek-ai/schemastery` and `undici`, plus cordis' `ctx.get` / `ctx.effect` / `ctx.inject`; the browser half requires only `react` and no UI package.
+- The host half depends only on the public exports of `@deepseek-ai/dsh-http-proxy`, `@deepseek-ai/schemastery` and `undici`, plus cordis' `ctx.get` / `ctx.effect` / `ctx.inject`; the browser half requires only platform module-table entries (`react`, `react/jsx-runtime`, `@deepseek-ai/dsh-client-ui-primitives`) and declares no non-baseline module request.
 - The configuration UI uses the official settings system (a `Config` schema + the settings page's `settings.section` slot + the shared `ctx.configForms` form). The section does not appear at all unless the host is running this row (`configForms.whileServed` gates it), and the plugin exits quietly on a deployment without a settings provider — everything else keeps working.
 
 ## Known limits
